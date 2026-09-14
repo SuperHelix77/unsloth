@@ -131,7 +131,8 @@ python3 scripts/nvfp4_budget_summarise.py --results-dir "$OUT" --out "$OUT/image
 - `clean` is true only when the contention bookends before and after the cell both read clean. A
   cell that is not clean shared the card with another CUDA context and its wall is not comparable.
 - Wall is the median of the unprofiled renders. The profiled renders are for attribution only and
-  carry their own overhead, reported as `profiler_overhead_ratio`.
+  carry their own overhead, reported as `profiler_overhead_ratio` against the hooked-but-unprofiled
+  median, since the profiled renders are hooked too.
 - The phase hooks synchronize three times per render. That cost is measured
   (`phase_sync_overhead_s`) on hooked-but-unprofiled renders rather than assumed negligible.
 - Two cells of the same configuration can differ in wall while agreeing on GPU busy to half a

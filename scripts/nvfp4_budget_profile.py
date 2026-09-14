@@ -80,6 +80,15 @@ def _union_busy_us(trace_path, window = None) -> dict:
     }
 
 
+def profiler_overhead_ratio(profiled: list, hooked: list) -> float:
+    """Profiled median over the HOOKED unprofiled median.
+
+    The profiled renders run with the phase hooks installed, so dividing by the unhooked wall
+    would charge the three syncs per render to the profiler and double-count them against
+    ``phase_sync_overhead_s``."""
+    return statistics.median(profiled) / statistics.median(hooked)
+
+
 def paired_times(a: list, b: list) -> dict:
     """``b`` relative to ``a``, paired by position. speedup > 1 means ``b`` is faster."""
     deltas = [x - y for x, y in zip(a, b)]
@@ -1097,7 +1106,7 @@ def run_one(args, graphs: str, pre: dict, root: str, out_path: Path) -> int:
         hooks.remove()
         prof.export_chrome_trace(str(trace_path))
         record["profiled_walls_s"] = [round(x, 5) for x in prof_walls]
-        record["profiler_overhead_ratio"] = statistics.median(prof_walls) / record["p50_s"]
+        record["profiler_overhead_ratio"] = profiler_overhead_ratio(prof_walls, hooked)
         record["paired_profiled_vs_unprofiled"] = paired_times(walls[: len(prof_walls)], prof_walls)
         record["trace"] = str(trace_path)
 

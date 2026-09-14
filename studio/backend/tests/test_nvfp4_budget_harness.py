@@ -196,6 +196,17 @@ def test_paired_times_reports_the_direction_it_claims():
     assert profile.paired_times(slow, slow)["speedup_p50"] == pytest.approx(1.0)
 
 
+def test_profiler_overhead_is_measured_against_the_hooked_baseline():
+    # The profiled renders are hooked; dividing by the unhooked wall would charge the phase syncs
+    # to the profiler and double-count them against phase_sync_overhead_s.
+    profile = _script("nvfp4_budget_profile")
+    unhooked = [1.0, 1.0]
+    hooked = [2.0, 2.0]
+    profiled = [3.0, 3.0]
+    assert profile.profiler_overhead_ratio(profiled, hooked) == pytest.approx(1.5)
+    assert profile.profiler_overhead_ratio(profiled, unhooked) == pytest.approx(3.0)
+
+
 def test_the_summariser_reads_a_results_directory_and_recomputes_nothing(tmp_path):
     summarise = _script("nvfp4_budget_summarise")
     (tmp_path / "cell_a.json").write_text(
