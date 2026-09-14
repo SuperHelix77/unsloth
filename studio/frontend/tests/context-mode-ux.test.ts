@@ -51,7 +51,7 @@ test("moving right or typing a number creates a custom context", () => {
 test("the Auto number editor opens at the fitted or safe offload context", () => {
   assert.match(
     panelCode,
-    /activeLoadedContext \?\? AUTO_OFFLOAD_CONTEXT_LENGTH/,
+    /activeLoadedContext \?\?[\s\S]{0,220}AUTO_OFFLOAD_CONTEXT_LENGTH/,
   );
   assert.match(panelCode, /const AUTO_OFFLOAD_CONTEXT_LENGTH = 8192;/);
 });

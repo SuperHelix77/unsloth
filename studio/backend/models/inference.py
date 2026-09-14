@@ -130,7 +130,7 @@ class LoadRequest(BaseModel):
     speculative_type: Optional[str] = Field(
         None,
         description = (
-            "Speculative decoding mode for GGUF models. Canonical values: "
+            "Speculative decoding mode for GGUF models and MLX safetensors/VLM models. Canonical values: "
             "'auto' (platform-aware: DSpark when the model ships a sidecar, "
             "else DFlash when it ships one, else MTP on MTP GGUFs, ngram-mod "
             "fallback for sub-3B), "
@@ -142,7 +142,7 @@ class LoadRequest(BaseModel):
             "Legacy values 'default' (-> auto), 'draft-mtp' (-> mtp), "
             "'draft-dspark' (-> dspark), 'draft-dflash' (-> dflash), "
             "'ngram-mod' (-> ngram), and 'ngram-simple' (kept as-is) are "
-            "still accepted. Ignored for non-GGUF models."
+            "still accepted. MLX VLMs use the installed mlx-vlm speculative path; unsupported pairs fall back or fail clearly."
         ),
     )
     spec_draft_n_max: Optional[int] = Field(
@@ -156,6 +156,15 @@ class LoadRequest(BaseModel):
             "MTP quants, and the measured sweet spot for DFlash too). Only "
             "applied when speculative_type resolves to 'mtp', 'mtp+ngram', "
             "'dspark' or 'dflash'."
+        ),
+    )
+    spec_draft_model_path: Optional[str] = Field(
+        None,
+        min_length = 1,
+        max_length = 4096,
+        description = (
+            "Optional native MLX DFlash/DFlare draft checkpoint path or Hugging Face repo. "
+            "When omitted, Unsloth uses an allow-listed target/drafter pair."
         ),
     )
     n_parallel: Optional[int] = Field(

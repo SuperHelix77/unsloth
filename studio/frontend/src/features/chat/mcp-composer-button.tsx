@@ -46,6 +46,7 @@ type McpPreset = {
   label?: string; // dropdown text, if different from displayName
   hint?: string; // shown when the row is highlighted
   disablesWebSearch?: boolean; // turn the built-in Search pill off when enabled
+  useOauth?: boolean; // use the app's OAuth flow instead of stored bearer headers
 };
 
 // Keyless remote MCP presets (rate-limited free tiers, no API key). Hugging Face runs
@@ -66,6 +67,14 @@ const MCP_PRESETS: readonly McpPreset[] = [
     id: "huggingface",
     displayName: "Hugging Face",
     url: "https://huggingface.co/mcp",
+  },
+  {
+    id: "github",
+    displayName: "GitHub",
+    url: "https://api.githubcopilot.com/mcp/readonly",
+    label: "GitHub (read-only)",
+    hint: "Sign in with GitHub via OAuth to browse repositories, issues, and pull requests.",
+    useOauth: true,
   },
 ] as const;
 
@@ -189,6 +198,7 @@ export function McpComposerButton({
     checked: boolean;
     existing?: McpServerConfig;
     disablesWebSearch?: boolean;
+    useOauth?: boolean;
   }) {
     const norm = normalizeMcpUrl(args.url);
     if (pendingUrlsRef.current.has(norm)) return; // guard rapid double-clicks
@@ -198,17 +208,19 @@ export function McpComposerButton({
       if (args.checked) {
         // Reuse the already-loaded row, else create one.
         if (args.existing) {
-          if (!args.existing.is_enabled) {
-            applyServer(
-              await updateMcpServer(args.existing.id, { isEnabled: true }),
-            );
-          }
+          applyServer(
+            await updateMcpServer(args.existing.id, {
+              isEnabled: true,
+              ...(args.useOauth === undefined ? {} : { useOauth: args.useOauth }),
+            }),
+          );
         } else {
           applyServer(
             await createMcpServer({
               displayName: args.displayName,
               url: args.url,
               isEnabled: true,
+              useOauth: args.useOauth,
             }),
           );
         }
@@ -239,6 +251,7 @@ export function McpComposerButton({
     existing?: McpServerConfig;
     hint?: string;
     disablesWebSearch?: boolean;
+    useOauth?: boolean;
   }) => (
     <DropdownMenuItem
       key={opts.key}
@@ -252,6 +265,7 @@ export function McpComposerButton({
           checked: !opts.enabled,
           existing: opts.existing,
           disablesWebSearch: opts.disablesWebSearch,
+          useOauth: opts.useOauth,
         });
       }}
       onPointerEnter={opts.hint ? () => setHintKey(opts.key) : undefined}
@@ -357,6 +371,7 @@ export function McpComposerButton({
               existing: servers.find((s) => normalizeMcpUrl(s.url) === norm),
               hint: preset.hint,
               disablesWebSearch: preset.disablesWebSearch,
+              useOauth: preset.useOauth,
             });
           })}
           <DropdownMenuItem

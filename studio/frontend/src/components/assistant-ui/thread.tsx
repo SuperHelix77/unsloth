@@ -169,6 +169,20 @@ import { getExternalReasoningCapabilities } from "@/features/chat/provider-capab
 import { useRagToolDisabled } from "@/features/chat/hooks/use-rag-tool-disabled";
 import { BypassPermissionsMenuItem } from "@/features/chat/bypass-permissions-menu-item";
 import { PermissionModeComposerPill } from "@/features/chat/permission-mode-select";
+import { ChatModePill } from "@/features/chat/chat-mode-pill";
+import { LocalSkillsPill } from "@/features/chat/local-skills-pill";
+import { LocalSkillsCommandMenu } from "@/features/chat/local-skills-command-menu";
+import {
+  LOCAL_SKILLS_CHANGED_EVENT,
+  type InstalledLocalSkill,
+  localSkillPrompt,
+  localSkillsForQuery,
+  localSkillsHelp,
+  localSlashQuery,
+  openLocalSkillsManager,
+  parseLocalSlashCommand,
+} from "@/features/chat/lib/local-skills";
+import { listLocalSkills, readLocalSkill } from "@/features/chat/api/local-skills-api";
 import {
   settleThreadScopedSettingsForCopy,
   useChatRuntimeStore,
@@ -2370,8 +2384,8 @@ const Composer: FC<{
     (s) => s.setImageToolsEnabled,
   );
   const toolsEnabled = useChatRuntimeStore((s) => s.toolsEnabled);
-
   const supportsTools = useChatRuntimeStore((s) => s.supportsTools);
+  const setToolsEnabled = useChatRuntimeStore((s) => s.setToolsEnabled);
   const codeToolsEnabled = useChatRuntimeStore((s) => s.codeToolsEnabled);
   const imageToolsEnabled = useChatRuntimeStore((s) => s.imageToolsEnabled);
   const supportsBuiltinImageGeneration = useChatRuntimeStore(
@@ -2423,7 +2437,7 @@ const Composer: FC<{
   // Narrow viewports collapse too: the labelled row is wider than a phone composer.
   const isMobile = useIsMobile();
   const pillCount =
-    3 +
+    5 +
     (ragEnabled ? 1 : 0) +
     (supportsBuiltinImageGeneration ? 1 : 0) +
     (artifactsEnabled ? 1 : 0) +
@@ -2489,6 +2503,7 @@ const Composer: FC<{
   // default action, while a menu the user might reach for instead cannot be
   // opened without letting go first.
   const plainPasteAtRef = useRef(0);
+  const localSkillInvocationRef = useRef(false);
   const notePlainPasteChord = useCallback(
     (event: KeyboardEvent<HTMLTextAreaElement>) => {
       plainPasteAtRef.current = isPlainPasteChord(event)
@@ -2604,6 +2619,85 @@ const Composer: FC<{
   );
 
   const composerText = useAuiState(({ composer }) => composer.text);
+  const [installedLocalSkills, setInstalledLocalSkills] = useState<InstalledLocalSkill[]>([]);
+  const refreshInstalledLocalSkills = useCallback(() => {
+    void listLocalSkills()
+      .then(setInstalledLocalSkills)
+      .catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    refreshInstalledLocalSkills();
+    window.addEventListener(LOCAL_SKILLS_CHANGED_EVENT, refreshInstalledLocalSkills);
+    return () => window.removeEventListener(LOCAL_SKILLS_CHANGED_EVENT, refreshInstalledLocalSkills);
+  }, [refreshInstalledLocalSkills]);
+  const localSkillQuery = localSlashQuery(composerText);
+  const localSkillItems =
+    localSkillQuery === null
+      ? []
+      : localSkillsForQuery(localSkillQuery, installedLocalSkills);
+  const localSkillMenuOpen =
+    localSkillQuery !== null && !disabled && !isDictating && !overlay;
+  const [localSkillMenuIndex, setLocalSkillMenuIndex] = useState(0);
+  const chooseLocalSkill = useCallback(
+    (command: string) => {
+      if (command === "/skills") {
+        flushResourcesSync(() => aui.composer().setText(""));
+        openLocalSkillsManager();
+        return;
+      }
+      if (command === "/github" || command === "/speed") {
+        setToolsEnabled(true);
+      }
+      if (command === "/plan" || command === "/goal") {
+        useChatRuntimeStore
+          .getState()
+          .setChatMode(command.slice(1) as "plan" | "goal");
+      }
+      flushResourcesSync(() => aui.composer().setText(`${command} `));
+      requestAnimationFrame(() => inputRef.current?.focus());
+    },
+    [aui, setToolsEnabled],
+  );
+  const handleLocalSkillMenuKeyDown = useCallback(
+    (event: KeyboardEvent<HTMLTextAreaElement>) => {
+      if (!localSkillMenuOpen) return false;
+      if (event.key === "ArrowDown" && localSkillItems.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        setLocalSkillMenuIndex((index) => (index + 1) % localSkillItems.length);
+        return true;
+      }
+      if (event.key === "ArrowUp" && localSkillItems.length > 0) {
+        event.preventDefault();
+        event.stopPropagation();
+        setLocalSkillMenuIndex((index) =>
+          index <= 0 ? localSkillItems.length - 1 : index - 1,
+        );
+        return true;
+      }
+      if (
+        (event.key === "Enter" || event.key === "Tab") &&
+        !event.shiftKey &&
+        localSkillItems.length > 0
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
+        chooseLocalSkill(
+          localSkillItems[Math.min(localSkillMenuIndex, localSkillItems.length - 1)]
+            .command,
+        );
+        return true;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        flushResourcesSync(() => aui.composer().setText(""));
+        return true;
+      }
+      return false;
+    },
+    [aui, chooseLocalSkill, localSkillItems, localSkillMenuIndex, localSkillMenuOpen],
+  );
   // Derived, not cleared in an effect: the offer retracts as soon as the link
   // leaves the draft, which also covers sending.
   const youtubeOfferUrl =
@@ -4599,6 +4693,68 @@ const Composer: FC<{
       // Read once per submit: a rejected send must not leave it armed.
       const forceQueue = forceQueueRef.current;
       forceQueueRef.current = false;
+      const liveComposerText = aui.composer().getState().text;
+      const localCommand = parseLocalSlashCommand(
+        liveComposerText,
+        installedLocalSkills,
+      );
+      if (localCommand?.skillName) {
+        event.preventDefault();
+        if (localSkillInvocationRef.current) return;
+        localSkillInvocationRef.current = true;
+        void readLocalSkill(localCommand.skillName)
+          .then((skill) => {
+            if (aui.composer().getState().text !== liveComposerText) {
+              toast.info("Local skill invocation cancelled", {
+                description: "The composer changed while the skill was loading.",
+              });
+              return;
+            }
+            flushResourcesSync(() =>
+              aui
+                .composer()
+                .setText(
+                  localSkillPrompt(
+                    skill.name,
+                    skill.instructions,
+                    localCommand.args,
+                  ),
+                ),
+            );
+            requestAnimationFrame(() => formRef.current?.requestSubmit());
+          })
+          .catch((error) => {
+            toast.error("Could not invoke local skill", {
+              description:
+                error instanceof Error
+                  ? error.message
+                  : "The SKILL.md file could not be read.",
+            });
+          })
+          .finally(() => {
+            localSkillInvocationRef.current = false;
+          });
+        return;
+      }
+      if (localCommand?.mode) {
+        useChatRuntimeStore.getState().setChatMode(localCommand.mode);
+      }
+      if (localCommand?.command === "/github" || localCommand?.command === "/speed") {
+        setToolsEnabled(true);
+      }
+      if (localCommand?.handled && !hasAttachments && !hasPendingAudio) {
+        event.preventDefault();
+        flushResourcesSync(() => aui.composer().setText(""));
+        toast.message(localCommand.help ? "Local skills" : `${localCommand.command} ready`, {
+          description: localCommand.help
+            ? localSkillsHelp()
+            : "Add an objective after the command, then press Enter.",
+        });
+        return;
+      }
+      if (localCommand && localCommand.message !== liveComposerText.trim()) {
+        flushResourcesSync(() => aui.composer().setText(localCommand.message));
+      }
       if (isResearchActive) {
         event.preventDefault();
         return;
@@ -4785,8 +4941,10 @@ const Composer: FC<{
       setImageToolsEnabled,
       setPendingImageEditReference,
       sendReservedComposer,
+      setToolsEnabled,
       shouldBlockSend,
       threadIsRunning,
+      installedLocalSkills,
     ],
   );
 
@@ -4859,6 +5017,8 @@ const Composer: FC<{
             <>
               {/* Permission-level pill: always visible, opens the level dropdown. */}
               <PermissionModeComposerPill side={effectiveMenuSide} />
+              <ChatModePill side={effectiveMenuSide} />
+              <LocalSkillsPill side={effectiveMenuSide} onSelectCommand={chooseLocalSkill} />
               {effectiveDeepResearchEnabled ? (
                 <DeepResearchComposerButton
                   onConfigure={() => setResearchWebsiteAccessOpen(true)}
@@ -4887,6 +5047,14 @@ const Composer: FC<{
           />
         ) : (
           <>
+            {localSkillMenuOpen ? (
+              <LocalSkillsCommandMenu
+                query={localSkillQuery ?? ""}
+                activeIndex={localSkillMenuIndex}
+                onSelect={chooseLocalSkill}
+                installedSkills={installedLocalSkills}
+              />
+            ) : null}
             <ComposerPrimitive.Input
               placeholder={
                 overlay ? "Type your edits for your image" : "Ask anything"
@@ -4902,8 +5070,14 @@ const Composer: FC<{
               // no effect on Latin / CJK / Devanagari.
               dir="auto"
               {...inputProps}
-              // Capture, so inputProps keeps the handlers it already owns.
+              // Keep the existing paste-chord capture contract; the local
+              // command menu is handled at bubble time before forwarding to
+              // the IME/send handler supplied by inputProps.
               onKeyDownCapture={notePlainPasteChord}
+              onKeyDown={(event) => {
+                if (handleLocalSkillMenuKeyDown(event)) return;
+                inputProps.onKeyDown(event);
+              }}
               onKeyUpCapture={endPlainPasteChord}
               onBlurCapture={endPlainPasteChord}
               addAttachmentOnPaste={false}

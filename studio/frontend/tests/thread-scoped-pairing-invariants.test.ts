@@ -617,7 +617,7 @@ test("the sampling params are read and applied through params", () => {
     "the snapshot, the held edit and the sameness check",
   );
   // One object, so they are gathered and set together rather than as fields.
-  assert.match(store, /paramsPatch\[key\] = value;/);
+  assert.match(store, /paramsPatch\[key\] = resolvedValue;/);
   assert.match(
     store,
     /if \(hasKeys\(paramsPatch\)\) \{\s*nextState\.params = \{ \.\.\.state\.params, \.\.\.paramsPatch \};/,

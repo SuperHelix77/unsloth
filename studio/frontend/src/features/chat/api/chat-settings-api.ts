@@ -3,6 +3,7 @@
 
 import { authFetch } from "@/features/auth";
 import type { ChatPresetSource } from "../presets/preset-policy";
+import type { ChatMode } from "../lib/chat-mode";
 import type {
   PermissionMode,
   RagAutoInject,
@@ -12,7 +13,6 @@ import type {
 } from "../stores/chat-runtime-store";
 import type { ResearchWebsitePolicy } from "../types/research";
 import type {
-  InferenceParams,
   PersistedInferenceParams,
 } from "../types/runtime";
 import {
@@ -61,6 +61,7 @@ export interface PersistedChatSettings {
   confirmToolCalls?: boolean;
   /** "full" (Full access) is session-only and never leaves the browser. */
   permissionMode?: Exclude<PermissionMode, "full">;
+  chatMode?: ChatMode;
   ragSource?: RagSource;
   ragMode?: RagMode;
   ragTopK?: number;

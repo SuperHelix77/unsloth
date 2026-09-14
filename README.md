@@ -9,6 +9,10 @@
 Unsloth is the first desktop app to run and train models.
 </h3>
 
+> **Unsloth Helix fork:** This build is best used with **Qwen3.8 27B** on Apple Silicon, where its long-context V1.1 and target-matched DFlash2 profile are optimized. The harness features are also available for other supported models and gracefully fall back when a model/backend does not provide a compatible accelerator.
+
+See the [27B Mac harness guide](docs/UNSLOTH_27B_MAC_HARNESS.md) for the local learning ladder, Mem0 privacy model, self-QLoRA acceptance gate, skills, workspace tabs, and computer-use controls.
+
 <p align="center">
   <a href="#-features">Features</a> •
   <a href="#-get-started">Quickstart</a> •

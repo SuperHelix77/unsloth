@@ -12,11 +12,14 @@ import {
   hasThreadScopedSettings,
   isThreadOwnedSettingKey,
   isThreadScopedSettingKey,
+  resolveChatModeForThread,
   sanitizeThreadScopedSettings,
 } from "../src/features/chat/utils/thread-scoped-settings.ts";
+import { createChatGoal } from "../src/features/chat/lib/chat-goal.ts";
 
 test("a full snapshot survives the round trip", () => {
   const settings = sanitizeThreadScopedSettings({
+    chatMode: "goal",
     reasoningEnabled: true,
     reasoningEffort: "high",
     toolsEnabled: true,
@@ -36,6 +39,7 @@ test("a full snapshot survives the round trip", () => {
   });
 
   assert.deepEqual(settings, {
+    chatMode: "goal",
     reasoningEnabled: true,
     reasoningEffort: "high",
     toolsEnabled: true,
@@ -72,8 +76,35 @@ test("out-of-contract values are dropped", () => {
       ragAutoInjectMinScore: 1.5,
       ragSource: { type: "kb" },
       reasoningEffort: "extreme",
+      chatMode: "execute",
     }),
     {},
+  );
+});
+
+test("Plan and Goal mode follow the conversation while normal is valid", () => {
+  assert.deepEqual(sanitizeThreadScopedSettings({ chatMode: "plan" }), {
+    chatMode: "plan",
+  });
+  assert.deepEqual(sanitizeThreadScopedSettings({ chatMode: "normal" }), {
+    chatMode: "normal",
+  });
+  assert.equal(isThreadOwnedSettingKey("chatMode"), true);
+});
+
+test("a legacy active goal reopens in Goal mode unless a mode was pinned", () => {
+  const goal = createChatGoal("Continue the work", { status: "active" });
+  assert.equal(resolveChatModeForThread({ goal }, "normal"), "goal");
+  assert.equal(
+    resolveChatModeForThread({ goal, chatMode: "normal" }, "goal"),
+    "normal",
+  );
+  assert.equal(
+    resolveChatModeForThread(
+      { goal: { ...goal, status: "completed" } },
+      "plan",
+    ),
+    "plan",
   );
 });
 

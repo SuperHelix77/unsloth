@@ -2,10 +2,12 @@
 // Copyright 2026-present the Unsloth AI Inc. team. All rights reserved. See /studio/LICENSE.AGPL-3.0
 
 // The chat settings that describe one conversation rather than the installation: the composer
-// pills, the permission level, the retrieval controls and the sampling params. Editing one with a
-// chat open writes this snapshot onto the thread, and reopening that thread applies it back.
+// mode and pills, the permission level, the retrieval controls and the sampling params. Editing
+// one with a chat open writes this snapshot onto the thread, and reopening that thread applies it back.
 
 import { normalizeSavedMinP } from "../lib/min-p-policy.ts";
+import { type ChatGoalState, sanitizeChatGoal } from "../lib/chat-goal.ts";
+import type { ChatMode } from "../lib/chat-mode.ts";
 import type {
   PermissionMode,
   RagAutoInject,
@@ -24,6 +26,10 @@ import {
 export type ThreadPermissionMode = Exclude<PermissionMode, "full">;
 
 export interface ThreadScopedSettings {
+  /** Durable Plan/Goal state. This is patched independently from the live runtime controls. */
+  goal?: ChatGoalState | null;
+  /** Plan/Goal mode for this conversation; the installation setting is the new-chat default. */
+  chatMode?: ChatMode;
   reasoningEnabled?: boolean;
   reasoningEffort?: ReasoningEffort;
   toolsEnabled?: boolean;
@@ -51,6 +57,17 @@ export interface ThreadScopedSettings {
   seed?: number | null;
   systemPrompt?: string;
   systemVariables?: string;
+}
+
+/** An older goal row may predate per-thread mode persistence. Keep that goal resumable on reopen,
+ * while an explicit mode (including normal) always wins. */
+export function resolveChatModeForThread(
+  settings: ThreadScopedSettings | null | undefined,
+  fallback: ChatMode,
+): ChatMode {
+  if (settings?.chatMode !== undefined) return settings.chatMode;
+  if (settings?.goal && settings.goal.status !== "completed") return "goal";
+  return fallback;
 }
 
 /** The subset living under `params` rather than as a store field of its own. */
@@ -93,6 +110,7 @@ const THREAD_SCOPED_BOOLEAN_KEYS = [
 
 const THREAD_SCOPED_ENUM_VALUES = {
   minPMode: ["server-default", "custom"],
+  chatMode: ["normal", "plan", "goal"],
   reasoningEffort: ["none", "minimal", "low", "medium", "high", "max", "xhigh"],
   permissionMode: ["ask", "auto", "off"],
   ragMode: ["hybrid", "lexical", "dense"],
@@ -146,6 +164,18 @@ const THREAD_SCOPED_SETTING_KEY_SET: ReadonlySet<string> = new Set(
   THREAD_SCOPED_SETTING_KEYS,
 );
 
+function applyChatGoalSnapshot(
+  settings: ThreadScopedSettings,
+  value: Record<string, unknown>,
+): void {
+  const goal = sanitizeChatGoal(value.goal);
+  if (goal) {
+    settings.goal = goal;
+  } else if (value.goal === null) {
+    settings.goal = null;
+  }
+}
+
 export function isThreadScopedSettingKey(
   key: string,
 ): key is ThreadScopedSettingKey {
@@ -167,14 +197,19 @@ export function isThreadOwnedSettingKey(key: string): boolean {
 }
 
 // the patch model is extra="forbid", so one out-of-contract field would 400 the whole write.
+// biome-ignore lint/complexity/noExcessiveCognitiveComplexity: this sanitizer mirrors the backend contract field by field.
 export function sanitizeThreadScopedSettings(
   value: unknown,
 ): ThreadScopedSettings {
   const settings: ThreadScopedSettings = {};
-  if (!isRecord(value)) return settings;
+  if (!isRecord(value)) {
+    return settings;
+  }
   const target = settings as Record<string, unknown>;
   for (const key of THREAD_SCOPED_BOOLEAN_KEYS) {
-    if (typeof value[key] === "boolean") target[key] = value[key];
+    if (typeof value[key] === "boolean") {
+      target[key] = value[key];
+    }
   }
   for (const [key, allowed] of Object.entries(THREAD_SCOPED_ENUM_VALUES)) {
     const candidate = value[key];
@@ -187,15 +222,24 @@ export function sanitizeThreadScopedSettings(
   }
   for (const [key, bounds] of Object.entries(THREAD_SCOPED_NUMBER_BOUNDS)) {
     const sanitized = sanitizeBoundedNumber(value[key], bounds);
-    if (sanitized !== undefined) target[key] = sanitized;
+    if (sanitized !== undefined) {
+      target[key] = sanitized;
+    }
   }
   for (const key of THREAD_SCOPED_STRING_KEYS) {
-    if (typeof value[key] === "string") target[key] = value[key];
+    if (typeof value[key] === "string") {
+      target[key] = value[key];
+    }
   }
   // null is a value here, not an absence, and sanitizeBoundedNumber reads it as one.
-  if (value.seed === null) settings.seed = null;
+  if (value.seed === null) {
+    settings.seed = null;
+  }
   const ragSource = sanitizeRagSource(value.ragSource);
-  if (ragSource) settings.ragSource = ragSource;
+  if (ragSource) {
+    settings.ragSource = ragSource;
+  }
+  applyChatGoalSnapshot(settings, value);
   return settings;
 }
 
@@ -203,8 +247,13 @@ export function sanitizeThreadScopedSettings(
 export function hasThreadScopedSettings(
   settings: ThreadScopedSettings | null | undefined,
 ): boolean {
-  if (!settings) return false;
-  return THREAD_SCOPED_SETTING_KEYS.some((key) => settings[key] !== undefined);
+  if (!settings) {
+    return false;
+  }
+  return (
+    settings.goal !== undefined ||
+    THREAD_SCOPED_SETTING_KEYS.some((key) => settings[key] !== undefined)
+  );
 }
 
 /** Normalize original saved snapshots before inheriting current defaults. */

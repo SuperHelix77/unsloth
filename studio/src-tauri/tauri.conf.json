@@ -1,6 +1,6 @@
 {
-  "productName": "Unsloth",
-  "identifier": "ai.unsloth.studio",
+  "productName": "Unsloth V1.1",
+  "identifier": "ai.unsloth.studio.v11",
   "build": {
     "beforeDevCommand": {
       "cwd": "../frontend",
@@ -21,7 +21,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Unsloth",
+        "title": "Unsloth V1.1",
         "width": 760,
         "height": 560,
         "center": true,

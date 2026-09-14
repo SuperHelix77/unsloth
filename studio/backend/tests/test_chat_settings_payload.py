@@ -131,6 +131,12 @@ def test_unset_fields_stay_out_of_the_merge():
     assert payload.model_dump(exclude_unset = True) == {"ragTopK": 5}
 
 
+@pytest.mark.parametrize("speculative_type", ["mtp", "dspark", "dflash", "mtp+ngram"])
+def test_experimental_speculative_modes_are_persistable(speculative_type):
+    payload = ChatSettingsPayload.model_validate({"speculativeType": speculative_type})
+    assert payload.model_dump(exclude_unset = True) == {"speculativeType": speculative_type}
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -140,7 +146,7 @@ def test_unset_fields_stay_out_of_the_merge():
         {"ragTopK": 51},
         {"ragAutoInjectMinScore": 2},
         {"ragMode": "vector"},
-        {"speculativeType": "mtp"},
+        {"speculativeType": "draft-mtp"},
         {"gpuMemoryMode": ""},
         {"ragSource": {"type": "kb"}},
         {"ragSource": {"type": "kb", "kbId": ""}},

@@ -107,6 +107,13 @@ _MLX_RUNTIME_MIRROR_FIELDS = (
     "mlx_kv_quant_note",
     "chat_template_override_requested",
     "chat_template_override_reason",
+    "speculative_type",
+    "speculative_requested_type",
+    "spec_drafter_kind",
+    "spec_draft_model_path_requested",
+    "spec_draft_bits",
+    "spec_draft_n_max",
+    "spec_fallback_reason",
 )
 
 
@@ -218,6 +225,13 @@ def _mirrored_model_entry(model_info: dict, model_name: str) -> dict:
         "max_context_length": model_info.get("max_context_length"),
         "requested_context_length": model_info.get("requested_context_length"),
         "context_length_enforced": model_info.get("context_length_enforced"),
+        "speculative_type": model_info.get("speculative_type"),
+        "speculative_requested_type": model_info.get("speculative_requested_type"),
+        "spec_drafter_kind": model_info.get("spec_drafter_kind"),
+        "spec_draft_model_path_requested": model_info.get("spec_draft_model_path_requested"),
+        "spec_draft_bits": model_info.get("spec_draft_bits"),
+        "spec_draft_n_max": model_info.get("spec_draft_n_max"),
+        "spec_fallback_reason": model_info.get("spec_fallback_reason"),
     }
 
 
@@ -252,6 +266,9 @@ class InferenceOrchestrator:
         # event cannot hit a sibling. Mutated under _dispatcher_lifecycle_lock while holding _gen_lock.
         self._exclusive_tts_pending = False
         self._exclusive_vram_probe_pending = False
+        # Adapter swaps use the same single-worker handoff as unload/TTS. Compare-mode
+        # requests must not start a dispatcher while the handoff is draining.
+        self._exclusive_adapter_pending = False
 
         # Dispatcher state for compare mode (adapter-controlled requests): bypass _gen_lock, send commands directly,
         # read from per-request mailboxes routed by a dispatcher thread on request_id.
@@ -1113,6 +1130,7 @@ class InferenceOrchestrator:
             if (
                 self._unload_pending
                 or self._exclusive_tts_pending
+                or getattr(self, "_exclusive_adapter_pending", False)
                 or getattr(self, "_exclusive_vram_probe_pending", False)
             ):
                 return False
@@ -1240,6 +1258,9 @@ class InferenceOrchestrator:
             return
         if self._exclusive_tts_pending:
             yield GenStreamError("Error: audio generation is in progress", public = True)
+            return
+        if getattr(self, "_exclusive_adapter_pending", False):
+            yield GenStreamError("Error: adapter switch is in progress", public = True)
             return
 
         # Ensure the dispatcher runs. _start_dispatcher serializes concurrent starters under
@@ -1492,6 +1513,9 @@ class InferenceOrchestrator:
         mlx_distributed: bool = False,
         mlx_kv_bits: Optional[int] = None,
         chat_template_override: Optional[str] = None,
+        speculative_type: Optional[str] = None,
+        spec_draft_n_max: Optional[int] = None,
+        spec_draft_model_path: Optional[str] = None,
         load_cancel_event: Optional[threading.Event] = None,
         post_handoff_expected_free_gb: Optional[dict[int, float]] = None,
         audio_device: Optional[str] = None,
@@ -1533,6 +1557,9 @@ class InferenceOrchestrator:
                 else None,
                 "mlx_kv_bits": mlx_kv_bits,
                 "chat_template_override": chat_template_override,
+                "speculative_type": speculative_type,
+                "spec_draft_n_max": spec_draft_n_max,
+                "spec_draft_model_path": spec_draft_model_path,
                 # Read in the worker, which hides the accelerators before detection.
                 "audio_device": audio_device,
             }
@@ -1857,6 +1884,94 @@ class InferenceOrchestrator:
         """What dictation holds, alongside active_model_name for chat."""
         from core.inference import stt_registry
         return stt_registry.resident()
+
+    def _run_exclusive_adapter_command(
+        self,
+        command_type: str,
+        *,
+        base_model_name: Optional[str] = None,
+        adapter_path: Optional[str] = None,
+        adapter_name: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> dict:
+        """Run a worker-side adapter operation while owning the response queue.
+
+        The worker is single-threaded. Waiting for compare requests to drain before
+        sending this command makes hotswap/revert atomic from the chat user's point
+        of view and avoids replacing weights underneath an active generation.
+        """
+        if not self._ensure_subprocess_alive():
+            raise RuntimeError("Inference subprocess is not running")
+        if not self.active_model_name:
+            raise RuntimeError("No active base model")
+
+        expected_model = base_model_name or self.active_model_name
+        if expected_model != self.active_model_name:
+            raise RuntimeError(
+                f"The requested base model '{expected_model}' is not the active model "
+                f"('{self.active_model_name}')"
+            )
+
+        with self._gen_lock:
+            with self._dispatcher_lifecycle_lock:
+                self._exclusive_adapter_pending = True
+            try:
+                if not self._wait_dispatcher_idle():
+                    raise RuntimeError("Cannot switch adapters while compare requests are active")
+                if not self._ensure_subprocess_alive() or self.active_model_name != expected_model:
+                    raise RuntimeError("The base model changed while preparing the adapter switch")
+
+                request_id = str(uuid.uuid4())
+                command = {
+                    "type": command_type,
+                    "request_id": request_id,
+                    "base_model_name": expected_model,
+                }
+                if adapter_path is not None:
+                    command["adapter_path"] = adapter_path
+                if adapter_name is not None:
+                    command["adapter_name"] = adapter_name
+                with self._send_order_lock:
+                    self._send_cmd(command)
+                    response = self._wait_response(
+                        command_type,
+                        timeout = timeout,
+                        expected_request_id = request_id,
+                    )
+                if response.get("error"):
+                    raise RuntimeError(response["error"])
+                return response
+            finally:
+                with self._dispatcher_lifecycle_lock:
+                    self._exclusive_adapter_pending = False
+
+    def hot_swap_adapter(
+        self,
+        adapter_path: str,
+        adapter_name: str,
+        base_model_name: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> dict:
+        """Load and activate a LoRA adapter without reloading the base model."""
+        return self._run_exclusive_adapter_command(
+            "adapter_hotswap",
+            base_model_name = base_model_name,
+            adapter_path = adapter_path,
+            adapter_name = adapter_name,
+            timeout = timeout,
+        )
+
+    def revert_to_base_model(
+        self,
+        base_model_name: Optional[str] = None,
+        timeout: float = 60.0,
+    ) -> dict:
+        """Disable all attached adapters and return to the resident base weights."""
+        return self._run_exclusive_adapter_command(
+            "adapter_revert",
+            base_model_name = base_model_name,
+            timeout = timeout,
+        )
 
     def unload_model(self, model_name: str) -> bool:
         # active_model_name can differ in case from the client's raw /unload name (the load path canonicalizes

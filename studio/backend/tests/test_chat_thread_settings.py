@@ -33,6 +33,7 @@ from storage import studio_db  # noqa: E402
 from utils.paths import studio_db_path  # noqa: E402
 
 SETTINGS = {
+    "chatMode": "goal",
     "toolsEnabled": True,
     "codeToolsEnabled": False,
     "deepResearchEnabled": False,
@@ -44,6 +45,24 @@ SETTINGS = {
     "ragAutoInject": "on",
     "ragAutoInjectMinScore": 0.42,
     "reasoningEffort": "high",
+}
+
+GOAL = {
+    "objective": "Apply the v1.1 ledger without losing functionality.",
+    "constraints": ["Keep existing chat and GitHub behavior."],
+    "verification": ["Run the backend and frontend checks."],
+    "milestones": [
+        {"id": "M1", "title": "Implement the control plane", "status": "active"},
+        {"id": "M2", "title": "Run verification", "status": "pending"},
+    ],
+    "evidenceRefs": ["commit:68f0ed19f"],
+    "blockers": [],
+    "status": "active",
+    "createdAt": 1_700_000_000_000,
+    "updatedAt": 1_700_000_000_100,
+    "plan": "Inspect, implement, test.",
+    "claimCeiling": "Verified local behavior only.",
+    "nextAction": "Run the full integration check.",
 }
 
 
@@ -71,6 +90,35 @@ def test_thread_settings_round_trip():
     assert settings.model_dump(exclude_unset = True) == SETTINGS
 
 
+def test_goal_round_trips_inside_the_thread_snapshot():
+    settings = ChatThreadSettings.model_validate({"goal": GOAL})
+    assert settings.model_dump(exclude_unset = True) == {"goal": GOAL}
+
+
+@pytest.mark.parametrize(
+    "bad_goal",
+    [
+        {**GOAL, "status": "running"},
+        {**GOAL, "objective": ""},
+        {**GOAL, "constraints": ["x" * 1001]},
+        {**GOAL, "verification": ["check"] * 17},
+        {**GOAL, "milestones": [{"id": "M1", "title": "x", "status": "bad"}]},
+        {**GOAL, "evidenceRefs": ["x"] * 17},
+        {**GOAL, "claimCeiling": "x" * 1001},
+        {**GOAL, "unknown": True},
+    ],
+)
+def test_goal_rejects_malformed_or_unbounded_state(bad_goal):
+    with pytest.raises(ValidationError):
+        ChatThreadSettings.model_validate({"goal": bad_goal})
+
+
+def test_goal_patch_can_be_cleared_without_replacing_other_settings():
+    payload = ChatThreadPatch.model_validate({"settingsPatch": {"goal": None}})
+    write = _settings_write_from_patch(payload.model_dump(exclude_unset = True))
+    assert write["merge"] == {"goal": None}
+
+
 @pytest.mark.parametrize(
     "field, value",
     [
@@ -87,6 +135,17 @@ def test_thread_settings_round_trip():
 def test_thread_settings_rejects_out_of_contract(field, value):
     with pytest.raises(ValidationError):
         ChatThreadSettings.model_validate({field: value})
+
+
+@pytest.mark.parametrize("mode", ["normal", "plan", "goal"])
+def test_chat_mode_round_trips_per_thread(mode):
+    settings = ChatThreadSettings.model_validate({"chatMode": mode})
+    assert settings.model_dump(exclude_unset = True) == {"chatMode": mode}
+
+
+def test_chat_mode_rejects_unknown_value():
+    with pytest.raises(ValidationError):
+        ChatThreadSettings.model_validate({"chatMode": "execute"})
 
 
 def test_thread_settings_survive_a_record_rewrite(tmp_path, monkeypatch):

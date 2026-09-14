@@ -175,6 +175,14 @@ studio = [
     "markdown-it-py>=3.0",
 ]
 
+# Optional because Mem0's vector/LLM dependencies are intentionally not added
+# to every inference install. The Studio integration defaults to account-local
+# Qdrant + HuggingFace embeddings and keeps the bounded JSON ledger as a
+# fallback when this extra is not installed.
+memory = [
+    "mem0ai>=0.1.118,<1.0",
+]
+
 triton = [
     "triton>=3.0.0 ; ('linux' in sys_platform)",
     "triton-windows ; (sys_platform == 'win32') and (platform_machine == 'AMD64' or platform_machine == 'x86_64')",

@@ -187,6 +187,22 @@ import {
   sandboxHasFiles,
 } from "@/components/assistant-ui/sandbox-reveal";
 import { NewProjectDialog } from "@/features/chat/components/new-project-dialog";
+import { ChatLearningDialog } from "@/features/chat/components/chat-learning-dialog";
+import { SelfQloraDialog } from "@/features/chat/components/self-qlora-dialog";
+import {
+  getLearningState,
+  setLearningConfig,
+  setLearningEnabled,
+} from "@/features/chat/api/learning-api";
+import {
+  getSelfTrainingState,
+  setSelfTrainingConfig,
+} from "@/features/chat/api/self-training-api";
+import {
+  HERMES_LEARNING_CHANGED_EVENT,
+  openHermesLearningManager,
+  openSelfQloraManager,
+} from "@/features/chat/lib/hermes-learning";
 import {
   useAppearanceCustomStore,
   useSettingsDialogStore,
@@ -224,6 +240,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactElement,
   type ReactNode,
 } from "react";
 import { isDownloadCancelled } from "@/lib/native-files";
@@ -261,6 +278,139 @@ function getTourId(pathname: string): string | null {
   if (pathname.startsWith("/export")) return "export";
   if (pathname.startsWith("/chat")) return "chat";
   return null;
+}
+
+/** Persistent permissions live in the sidebar so learning never interrupts a chat turn. */
+function HermesLearningSidebarControls(): ReactElement {
+  const [learningEnabled, setLearningEnabledState] = useState(true);
+  const [mem0Enabled, setMem0Enabled] = useState(true);
+  const [onTheFlySkills, setOnTheFlySkills] = useState(true);
+  const [autoTrain, setAutoTrain] = useState(false);
+  const [busy, setBusy] = useState(true);
+
+  const refresh = useCallback(() => {
+    void Promise.all([getLearningState(), getSelfTrainingState()])
+      .then(([learning, training]) => {
+        setLearningEnabledState(learning.enabled);
+        setMem0Enabled(learning.mem0Enabled !== false);
+        setOnTheFlySkills(learning.onTheFlySkills !== false);
+        setAutoTrain(training.autoTrain);
+      })
+      .catch(() => undefined)
+      .finally(() => setBusy(false));
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    window.addEventListener(HERMES_LEARNING_CHANGED_EVENT, refresh);
+    return () => window.removeEventListener(HERMES_LEARNING_CHANGED_EVENT, refresh);
+  }, [refresh]);
+
+  const toggleLearning = (enabled: boolean) => {
+    setLearningEnabledState(enabled);
+    void setLearningEnabled(enabled)
+      .then(() => window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT)))
+      .catch(() => {
+        setLearningEnabledState(!enabled);
+        toast.error("Could not update learning permission");
+      });
+  };
+
+  const toggleAutoTrain = (enabled: boolean) => {
+    setAutoTrain(enabled);
+    void setSelfTrainingConfig({ autoTrain: enabled })
+      .then(() => window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT)))
+      .catch(() => {
+        setAutoTrain(!enabled);
+        toast.error("Could not update automatic QLoRA permission");
+      });
+  };
+
+  const toggleMem0 = (enabled: boolean) => {
+    setMem0Enabled(enabled);
+    void setLearningConfig({ mem0Enabled: enabled })
+      .then(() => window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT)))
+      .catch(() => {
+        setMem0Enabled(!enabled);
+        toast.error("Could not update Mem0 permission");
+      });
+  };
+
+  const toggleOnTheFlySkills = (enabled: boolean) => {
+    setOnTheFlySkills(enabled);
+    void setLearningConfig({ onTheFlySkills: enabled })
+      .then(() => window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT)))
+      .catch(() => {
+        setOnTheFlySkills(!enabled);
+        toast.error("Could not update on-the-fly skill permission");
+      });
+  };
+
+  return (
+    <SidebarMenuItem>
+      <div className="rounded-[14px] border border-border/60 bg-transparent px-2 py-2 group-data-[collapsible=icon]:mx-auto group-data-[collapsible=icon]:size-[34px] group-data-[collapsible=icon]:overflow-hidden group-data-[collapsible=icon]:p-0">
+        <div className="flex items-center gap-2 group-data-[collapsible=icon]:h-full group-data-[collapsible=icon]:justify-center">
+          <HugeiconsIcon icon={ZapIcon} strokeWidth={1.75} className="size-[19px] shrink-0 text-nav-fg" />
+          <div className="min-w-0 flex-1 group-data-[collapsible=icon]:hidden">
+            <span className="block truncate text-ui-12 font-semibold text-nav-fg">Learning</span>
+            <span className="block truncate text-ui-11 text-muted-foreground">No chat interruption</span>
+          </div>
+          <button
+            type="button"
+            className="text-ui-11 text-muted-foreground hover:text-foreground group-data-[collapsible=icon]:hidden"
+            onClick={openHermesLearningManager}
+          >
+            Details
+          </button>
+        </div>
+        <div className="mt-2 grid gap-1.5 group-data-[collapsible=icon]:hidden">
+          <label className="flex items-center justify-between gap-2 text-ui-11 text-muted-foreground">
+            <span>Collect task lessons</span>
+            <Switch
+              checked={learningEnabled}
+              disabled={busy}
+              onCheckedChange={toggleLearning}
+              aria-label="Collect task lessons"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-2 text-ui-11 text-muted-foreground">
+            <span>Allow auto QLoRA</span>
+            <Switch
+              checked={autoTrain}
+              disabled={busy || !learningEnabled}
+              onCheckedChange={toggleAutoTrain}
+              aria-label="Allow automatic QLoRA training"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-2 text-ui-11 text-muted-foreground">
+            <span>Draft skills during tasks</span>
+            <Switch
+              checked={onTheFlySkills}
+              disabled={busy || !learningEnabled}
+              onCheckedChange={toggleOnTheFlySkills}
+              aria-label="Draft skills during tasks"
+            />
+          </label>
+          <label className="flex items-center justify-between gap-2 text-ui-11 text-muted-foreground">
+            <span>Remember experiences with Mem0</span>
+            <Switch
+              checked={mem0Enabled}
+              disabled={busy || !learningEnabled}
+              onCheckedChange={toggleMem0}
+              aria-label="Remember task experiences with Mem0"
+            />
+          </label>
+          <button
+            type="button"
+            className="mt-0.5 text-left text-ui-11 text-primary hover:underline"
+            onClick={openSelfQloraManager}
+          >
+            Open self-QLoRA bench
+          </button>
+        </div>
+      </div>
+    </SidebarMenuItem>
+  );
 }
 
 // Optional user-menu shortcuts that jump to a settings tab; the id is the tab id.
@@ -3452,9 +3602,12 @@ export function AppSidebar() {
                   <span className="relative -top-px truncate font-heading text-[calc(13px+0.5rem*var(--ui-font-scale,1))] font-semibold tracking-[0em] leading-tight text-black dark:text-white dark:tracking-[0.02em]">
                     unsloth
                   </span>
-                  <span className="nav-badge ml-0.5 inline-flex shrink-0 items-center justify-center rounded-full border border-nav-beta-border px-[5px] pt-[3px] pb-[2px] text-[calc(0.5rem*var(--ui-font-scale,1))] font-medium leading-none tracking-[0.04em] text-nav-fg-muted antialiased subpixel-antialiased shadow-[0_1px_2px_rgba(0,0,0,0.06)] dark:shadow-[0_1px_2px_rgba(0,0,0,0.35)]">
-                    {t("shell.beta")}
-                  </span>
+                  <img
+                    src="/helix-engine.svg"
+                    alt="Unsloth Helix"
+                    title="Unsloth Helix engine"
+                    className="relative top-[2px] ml-0.5 h-[calc(12px+0.25rem*var(--ui-font-scale,1))] w-auto shrink-0 self-end object-contain opacity-85 dark:invert"
+                  />
                 </Link>
               <div className="flex shrink-0 items-center gap-0.25">
                 <Tooltip>
@@ -4320,6 +4473,7 @@ export function AppSidebar() {
               </button>
             </SidebarMenuItem>
           )}
+          <HermesLearningSidebarControls />
           {/* Collapsed rail has no room for the cog on the profile row, so it
               sits above the avatar instead. */}
           <NavItem
@@ -4489,6 +4643,8 @@ export function AppSidebar() {
       </SidebarFooter>
     </Sidebar>
     <ChatSearchDialog />
+    <ChatLearningDialog />
+    <SelfQloraDialog />
     {!isTauri && (
       <ShutdownDialog
         open={shutdownOpen}

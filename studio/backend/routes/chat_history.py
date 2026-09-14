@@ -114,6 +114,38 @@ class ChatRagKnowledgeBaseSource(BaseModel):
     kbId: str = Field(min_length = 1, max_length = 256)
 
 
+ChatGoalItem = Annotated[str, Field(min_length = 1, max_length = 1000)]
+ChatGoalMilestoneId = Annotated[str, Field(min_length = 1, max_length = 64)]
+
+
+class ChatGoalMilestone(BaseModel):
+    model_config = ConfigDict(extra = "forbid", allow_inf_nan = False)
+
+    id: ChatGoalMilestoneId
+    title: Annotated[str, Field(min_length = 1, max_length = 500)]
+    status: Literal["pending", "active", "completed", "blocked"]
+
+
+class ChatGoalState(BaseModel):
+    """Durable Plan -> Goal state carried inside a thread's settings snapshot."""
+
+    model_config = ConfigDict(extra = "forbid", allow_inf_nan = False)
+
+    objective: str = Field(min_length = 1, max_length = 4096)
+    constraints: list[ChatGoalItem] = Field(default_factory = list, max_length = 16)
+    verification: list[ChatGoalItem] = Field(default_factory = list, max_length = 16)
+    milestones: list[ChatGoalMilestone] = Field(default_factory = list, max_length = 32)
+    evidenceRefs: list[ChatGoalItem] = Field(default_factory = list, max_length = 16)
+    blockers: list[ChatGoalItem] = Field(default_factory = list, max_length = 16)
+    status: Literal["draft", "active", "paused", "completed"]
+    createdAt: Annotated[int, Field(ge = 1)]
+    updatedAt: Annotated[int, Field(ge = 1)]
+    plan: Optional[str] = Field(default = None, max_length = 32768)
+    claimCeiling: Optional[ChatGoalItem] = None
+    nextAction: Optional[ChatGoalItem] = None
+    completedAt: Optional[Annotated[int, Field(ge = 1)]] = None
+
+
 class ChatThreadSettings(BaseModel):
     """The chat settings captured per thread; a thread storing none uses the global ones."""
 
@@ -121,6 +153,8 @@ class ChatThreadSettings(BaseModel):
     # strict reader can parse back.
     model_config = ConfigDict(extra = "forbid", allow_inf_nan = False)
 
+    goal: Optional[ChatGoalState] = None
+    chatMode: Optional[Literal["normal", "plan", "goal"]] = None
     reasoningEnabled: Optional[bool] = None
     reasoningEffort: Optional[
         Literal["none", "minimal", "low", "medium", "high", "max", "xhigh"]
@@ -490,6 +524,7 @@ class ChatSettingsPayload(BaseModel):
     confirmToolCalls: Optional[bool] = None
     # "full" (Full access) is session-only by design and never persisted.
     permissionMode: Optional[Literal["ask", "auto", "off"]] = None
+    chatMode: Optional[Literal["normal", "plan", "goal"]] = None
     ragSource: Optional[
         Annotated[
             Union[ChatRagThreadSource, ChatRagKnowledgeBaseSource],
@@ -504,7 +539,12 @@ class ChatSettingsPayload(BaseModel):
     ragOcrScanned: Optional[bool] = None
     ragCaptionFigures: Optional[bool] = None
     # Standing load preferences the model-load path reads outside the store.
-    speculativeType: Optional[Literal["auto", "ngram", "off"]] = None
+    # MTP/DFlash are explicit experimental opt-ins; Qwen3.8's Darwin v1.1
+    # policy still turns an unset/Auto request into Off, while a concrete pick
+    # reaches the capability-checked loader.
+    speculativeType: Optional[
+        Literal["auto", "mtp", "dspark", "dflash", "ngram", "mtp+ngram", "off"]
+    ] = None
     gpuMemoryMode: Optional[Literal["auto", "manual"]] = None
     expandQuantizations: Optional[bool] = None
     showAllQuantizations: Optional[bool] = None
