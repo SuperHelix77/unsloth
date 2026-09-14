@@ -326,8 +326,12 @@ _WINDOW_BUCKET = {"phase:te": "text_encoder", "phase:vae": "vae_decode"}
 _KERNEL_CATS = ("kernel", "gpu_memcpy", "gpu_memset")
 
 
-def classify(name: str, window: str | None) -> str:
-    """Bucket one device-side kernel by name plus the phase window it ran in."""
+def classify(
+    name: str,
+    window: str | None,
+    arm: str | None = None,
+) -> str:
+    """Bucket one device-side kernel by name, the phase window it ran in, and the cell's arm."""
     if window in _WINDOW_BUCKET:
         return _WINDOW_BUCKET[window]
     low = name.lower()
@@ -342,12 +346,14 @@ def classify(name: str, window: str | None) -> str:
     # scheduler or VAE launches: the fp8 arms, which have no barrier at all, reported one.
     if "fillfunctor<c10::bfloat16>" in low and window == "phase:denoise":
         return "barrier_fill"
-    # fp8: torchao/cublas scaled_mm. ``nvjet_`` is cublasLt's SM100 GEMM family; inside the denoise
-    # window on a quantised arm it is the scaled_mm, and outside it is somebody else's GEMM.
+    # fp8: torchao/cublas scaled_mm. ``nvjet_`` is cublasLt's SM100 GEMM family and carries no dtype
+    # in its name, so it only means scaled_mm on the fp8 arm inside the denoise window. A bf16 arm,
+    # and the linears a partially converted NVFP4 transformer leaves unquantised, dispatch dense
+    # bf16 GEMMs under the same family: labelling those fp8 reports scaled-MM time that never ran.
     if "enable_3x_kernel_for_sm10" in low or "scaled_mm" in low:
         return "fp8_scaled_mm"
     if "nvjet" in low:
-        return "fp8_scaled_mm" if window == "phase:denoise" else "gemm_other"
+        return "fp8_scaled_mm" if (window == "phase:denoise" and arm == "fp8") else "gemm_other"
     if "int8" in low or "i8gemm" in low or "s8s8" in low:
         return "int8"
     # An inductor kernel is an inductor kernel whatever it was fused from, so this outranks the
@@ -418,7 +424,12 @@ def _window_of(windows: list, ts: float) -> str | None:
     return hit
 
 
-def bucket_table(trace_path: Path, n_renders: int, steps: int) -> dict:
+def bucket_table(
+    trace_path: Path,
+    n_renders: int,
+    steps: int,
+    arm: str | None = None,
+) -> dict:
     trace = json.loads(Path(trace_path).read_text())
     windows = _phase_windows(trace)
     per_bucket: dict = defaultdict(lambda: [0.0, 0])
@@ -448,7 +459,7 @@ def bucket_table(trace_path: Path, n_renders: int, steps: int) -> dict:
         dur = float(e.get("dur", 0.0))
         ts = float(e["ts"])
         win = _window_of(windows, ts + dur / 2.0)
-        bucket = classify(name, win)
+        bucket = classify(name, win, arm)
         b = per_bucket[bucket]
         b[0] += dur
         b[1] += 1
@@ -1084,7 +1095,7 @@ def run_one(args, graphs: str, pre: dict, root: str, out_path: Path) -> int:
         record["paired_profiled_vs_unprofiled"] = paired_times(walls[: len(prof_walls)], prof_walls)
         record["trace"] = str(trace_path)
 
-        table = bucket_table(trace_path, args.profiled, args.steps)
+        table = bucket_table(trace_path, args.profiled, args.steps, args.arm)
         record.update(
             {
                 k: table[k]

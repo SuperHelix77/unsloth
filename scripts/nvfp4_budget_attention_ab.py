@@ -338,7 +338,7 @@ def main(argv = None) -> int:
                 render(args.seed_base)
             hooks.remove()
             prof.export_chrome_trace(str(trace_path))
-            table = PG.bucket_table(trace_path, 1, args.steps)
+            table = PG.bucket_table(trace_path, 1, args.steps, args.arm)
             per_backend[label]["buckets"] = table["buckets"]
             per_backend[label]["attention_kernel_names"] = table["attention_kernel_names"]
             per_backend[label]["attention_by_kernel"] = table["attention_by_kernel"]

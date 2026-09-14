@@ -92,8 +92,21 @@ def test_the_phase_window_outranks_the_kernel_name():
     gemm = "nvjet_tst_128x128_64x4_1x1_v_bz_coopA_NTn"
     assert profile.classify(gemm, "phase:te") == "text_encoder"
     assert profile.classify(gemm, "phase:vae") == "vae_decode"
-    assert profile.classify(gemm, "phase:denoise") == "fp8_scaled_mm"
-    assert profile.classify(gemm, None) == "gemm_other"
+    assert profile.classify(gemm, "phase:denoise", "fp8") == "fp8_scaled_mm"
+    assert profile.classify(gemm, None, "fp8") == "gemm_other"
+
+
+def test_only_the_fp8_arm_reads_a_denoise_nvjet_gemm_as_scaled_mm():
+    # nvjet is cublasLt's generic SM100 GEMM family, so a bf16 cell and the unquantised linears of a
+    # partially converted NVFP4 transformer both land in it. Calling those fp8 invents scaled-MM time.
+    profile = _script("nvfp4_budget_profile")
+    gemm = "nvjet_tst_128x128_64x4_1x1_v_bz_coopA_NTn"
+    assert profile.classify(gemm, "phase:denoise", "bf16") == "gemm_other"
+    assert profile.classify(gemm, "phase:denoise", "nvfp4") == "gemm_other"
+    assert profile.classify(gemm, "phase:denoise") == "gemm_other"
+    # A kernel that names the scaled path stays fp8 whatever the arm says.
+    scaled = "cutlass3x_sm100_enable_3x_kernel_for_sm10x"
+    assert profile.classify(scaled, "phase:denoise", "bf16") == "fp8_scaled_mm"
 
 
 def test_gpu_busy_unions_overlapping_intervals_instead_of_summing_them(tmp_path):
