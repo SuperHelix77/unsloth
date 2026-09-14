@@ -668,8 +668,22 @@ def _install_whole_compile(torch_mod, denoisers, state) -> dict:
 
 
 def _resolve_guidance(args, model):
+    """The guidance a render uses. The video table is a separate one: no video family is in the
+    image table, so asking it would profile Wan at guidance 0.0 with CFG off."""
     if args.guidance is not None:
         return args.guidance
+    if args.backend == "video":
+        from core.inference.video_families import (
+            default_video_generation_params,
+            detect_video_family,
+        )
+
+        fam = detect_video_family(model or "", args.family) or detect_video_family(model or "")
+        fallback = (fam.default_steps, fam.default_guidance) if fam is not None else (40, 4.0)
+        _steps, guidance = default_video_generation_params(
+            model, getattr(fam, "name", None), fallback = fallback
+        )
+        return guidance
     from core.inference.diffusion_families import default_generation_params, detect_family
 
     fam = detect_family(args.family) or detect_family(model)
@@ -1164,16 +1178,24 @@ def run_one(args, graphs: str, pre: dict, root: str, out_path: Path) -> int:
         import traceback
 
         traceback.print_exc()
-        record["contention"]["post"] = contention_check("post", str(out_path.parent))
-        record["clean"] = (
-            pre.get("verdict") == "clean" and record["contention"]["post"].get("verdict") == "clean"
-        )
-        flush(exc)
+        # Unload FIRST, and keep the bookend best-effort: it allocates two 8192x8192 tensors, so after
+        # an OOM it raises in turn and the failure record is never written.
         try:
             if backend is not None:
                 backend.unload()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            record["contention"]["post"] = contention_check("post", str(out_path.parent))
+        except Exception as post_exc:  # noqa: BLE001
+            record["contention"]["post"] = {
+                "verdict": "unavailable",
+                "error": f"{type(post_exc).__name__}: {str(post_exc)[:200]}",
+            }
+        record["clean"] = (
+            pre.get("verdict") == "clean" and record["contention"]["post"].get("verdict") == "clean"
+        )
+        flush(exc)
         return 1
 
     post = contention_check("post", str(out_path.parent))

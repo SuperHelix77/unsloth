@@ -584,6 +584,12 @@ _VAE_COMPILE_DENY: frozenset[str] = frozenset({"AutoencoderKLQwenImage", "Autoen
 _VAE_COMPILE_ALLOW: frozenset[str] = frozenset({"AutoencoderKL"})
 
 
+def vae_decode_compile_allowed(pipe: Any) -> bool:
+    """Public form for the compile-cache key: a bundle saved without the VAE decode artifacts must
+    not read as a hit once this pipe compiles it, or the decode recompiles on every load."""
+    return _vae_decode_compile_allowed(pipe)
+
+
 def _vae_decode_compile_allowed(pipe: Any) -> bool:
     """Whether the VAE decode compile covers this pipe; U-Nets always do and ignore the env."""
     if _denoiser_unet(pipe) is not None:

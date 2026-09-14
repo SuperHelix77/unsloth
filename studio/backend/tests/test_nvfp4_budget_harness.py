@@ -447,6 +447,31 @@ def _gen_args(**overrides):
     return argparse.Namespace(**base)
 
 
+def test_video_guidance_comes_from_the_video_family_table():
+    """A video profile takes Wan's guidance 5.0, not the image table's 0.0 fallback."""
+    # No video family is in the image table, so asking it profiles Wan with CFG off and understates the denoise.
+    profile = _script("nvfp4_budget_profile")
+    args = _gen_args(backend = "video", family = "wan2.2-ti2v-5b", guidance = None)
+    assert profile._resolve_guidance(args, "Wan-AI/Wan2.2-TI2V-5B-Diffusers") == 5.0
+    explicit = _gen_args(backend = "video", family = "wan2.2-ti2v-5b", guidance = 1.0)
+    assert profile._resolve_guidance(explicit, "Wan-AI/Wan2.2-TI2V-5B-Diffusers") == 1.0
+    unknown = _gen_args(backend = "video", family = None, guidance = None)
+    assert profile._resolve_guidance(unknown, "some/unknown-video-model") == 4.0
+
+
+def test_a_failed_cell_unloads_before_its_closing_bookend():
+    """The failure path unloads before the contention bookend, which allocates on the same card."""
+    # The bookend takes two 8192x8192 tensors: run before the unload, it raises again after an OOM and the failure
+    # record is never written.
+    import inspect
+
+    profile = _script("nvfp4_budget_profile")
+    src = inspect.getsource(profile.run_one)
+    tail = src.split("a refusal IS the result and is recorded")[1]
+    assert tail.index("backend.unload()") < tail.index('contention_check("post"')
+    assert tail.index('contention_check("post"') < tail.index("flush(exc)")
+
+
 def test_the_image_path_renders_with_the_negative_prompt_it_was_given():
     # The image backend's generate() takes negative_prompt; parsing --negative-prompt and then
     # dropping it renders the positive-only case under the label of the requested one.

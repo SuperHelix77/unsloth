@@ -1365,3 +1365,14 @@ def test_compiled_shapes_are_static_reports_the_stream_merging_downgrade(monkeyp
     assert ds_mod.compiled_shapes_are_static(plain, SPEED_MAX) is True
     assert ds_mod.compiled_shapes_are_static(merging, SPEED_OFF) is False
     assert ds_mod.compiled_shapes_are_static(merging, SPEED_EAGER) is False
+
+
+def test_the_loader_keys_the_compile_bundle_on_the_vae_decode_decision():
+    """Both compile_cache.begin() call sites feed the VAE decode decision into the cache key."""
+    # The decode compiles lazily, so a bundle that predates it stays a hit, the context stays clean and the VAE
+    # artifacts are never saved: the key has to move with the decision.
+    from pathlib import Path
+
+    src = (Path(__file__).resolve().parents[1] / "core" / "inference" / "diffusion.py").read_text()
+    assert src.count('"vae_decode": vae_decode_compile_allowed(') == 2
+    assert ds_mod.vae_decode_compile_allowed is not None
