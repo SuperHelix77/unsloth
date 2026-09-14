@@ -509,6 +509,35 @@ def test_runtime_recovery_strips_user_mtp_extra_args(monkeypatch):
     assert "draft-mtp" not in captured["extra_args"]
 
 
+def test_runtime_recovery_strips_dflash_extra_args(monkeypatch):
+    # DFlash has the same fail-open rule as embedded MTP: a dead drafter must not
+    # be reintroduced by the user's extra args on the ordinary-decoding reload.
+    b = _recovery_backend()
+    b._tensor_parallel = False
+    b._speculative_type = "draft-dflash"
+    b._spec_drafter_kind = "dflash"
+    b._last_load_intent = replace(
+        b._last_load_intent,
+        speculative_type = "dflash",
+        extra_args = ["--spec-type", "draft-dflash", "--model-draft", "/models/dflash.gguf"],
+    )
+    done = threading.Event()
+    captured = {}
+
+    def _fake_load_model(intent):
+        captured.update(vars(intent))
+        done.set()
+        return True
+
+    monkeypatch.setattr(b, "load_model", _fake_load_model)
+    assert b._maybe_recover_from_mtp_crash(RuntimeError("dflash exited")) is True
+    assert done.wait(timeout = 5)
+    assert captured["speculative_type"] == "off"
+    assert "--spec-type" not in captured["extra_args"]
+    assert "draft-dflash" not in captured["extra_args"]
+    assert "--model-draft" not in captured["extra_args"]
+
+
 def test_runtime_recovery_restores_requested_mode(monkeypatch):
     # After the off-reload, /status must show the user's requested mode + the
     # runtime-error note, not a bare "off" (matches the startup MTP fallback).

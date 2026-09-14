@@ -57,6 +57,25 @@ logger = get_logger(__name__)
 VLM_PREFILL_STEP = 2048
 VLM_PROMPT_CACHE_ENTRIES = 6
 
+# Qwythos-9B-v2 inherits Qwen3.5's long context, but the app's automatic MLX
+# load sentinel used to leave the bundled runtime's short default in charge.
+# Keep the app-level policy at the same 64K window used by the Qwen3.8 V1.1
+# profile; an explicit request still wins.
+MLX_QWYTHOS_PREFERRED_CONTEXT = 65_536
+
+
+def mlx_is_qwythos_model(model_identifier) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", str(model_identifier or "").lower())
+    return "qwythos" in compact and "9b" in compact
+
+
+def mlx_effective_context_length(model_identifier, requested: int) -> int:
+    """Resolve the durable app default for Qwythos without changing explicit settings."""
+    requested = int(requested or 0)
+    if requested > 0 or not mlx_is_qwythos_model(model_identifier):
+        return requested
+    return MLX_QWYTHOS_PREFERRED_CONTEXT
+
 
 def vlm_prefill_step():
     """mlx-vlm's own step, so an unreused request prefills as mlx-vlm does. It divides every
@@ -1141,6 +1160,7 @@ def _build_generation_stats(
     gen_tps,
     cached_n = 0,
     finish_reason = None,
+    speculative = None,
 ):
     """Map mlx stream stats onto the usage/timings shape llama-server emits, plus the reason
     generation ended."""
@@ -1152,7 +1172,7 @@ def _build_generation_stats(
     prompt_ms = (prompt_n / prompt_tps * 1000.0) if prompt_tps > 0 else 0.0
     predicted_ms = (gen_n / gen_tps * 1000.0) if gen_tps > 0 else 0.0
     total_prompt_n = prompt_n + cached_n
-    return {
+    stats = {
         "usage": {
             "prompt_tokens": total_prompt_n,
             "completion_tokens": gen_n,
@@ -1175,6 +1195,20 @@ def _build_generation_stats(
         # Latched where generation exits, so a cancel arriving afterwards cannot rewrite the reason the completion
         # actually ended for.
         "finish_reason": finish_reason,
+    }
+    if speculative is not None:
+        stats["speculative"] = speculative
+    return stats
+
+
+def _mlx_speculative_counters(draft):
+    """Read mlx-vlm's per-round counters into the app's stable stats shape."""
+    accepted = list(getattr(draft, "accept_lens", None) or ())
+    drafted = list(getattr(draft, "draft_lens", None) or ())
+    return {
+        "draft_tokens": int(sum(int(value) for value in drafted)),
+        "accepted_tokens": int(sum(int(value) for value in accepted)),
+        "steps": int(len(accepted)),
     }
 
 
@@ -2180,6 +2214,18 @@ class MLXInferenceBackend:
         self._served_context = None
         self._template_override = _template_override_status(None, None, None)[1]
 
+        # MLX speculative decoding is loaded alongside the target model. Keep
+        # this state private to the worker; the parent receives the resolved
+        # values through the model-info mirror below.
+        self._speculative_type = "off"
+        self._spec_requested_type = "auto"
+        self._spec_draft_model_path_requested = None
+        self._spec_draft = None
+        self._spec_draft_model_path = None
+        self._spec_draft_n_max = None
+        self._spec_draft_bits = None
+        self._spec_fallback_reason = None
+
         self._prompt_cache_history = None
         self._prompt_cache_unavailable = False
         self._vlm_snapshot_store = None
@@ -2476,6 +2522,344 @@ class MLXInferenceBackend:
             )
         return enforced
 
+    @staticmethod
+    def _normalize_mlx_speculative_type(value):
+        mode = str(value or "auto").strip().lower()
+        return {
+            "default": "auto",
+            "draft-dflash": "dflash",
+            "draft-dflare": "dflare",
+            "none": "off",
+            "disable": "off",
+            "disabled": "off",
+        }.get(mode, mode)
+
+    @staticmethod
+    def _default_mlx_draft_model(target_name, mode):
+        """Known public target/drafter pairs.
+
+        A DFlash/DFlare checkpoint is not a standalone language model: its
+        hidden-size, layer-tap and tokenizer dimensions must match the target.
+        Keep automatic selection deliberately allow-listed rather than guessing
+        from a repository name. An explicit path can serve new pairs.
+        """
+        target = str(target_name or "").lower()
+        if mlx_is_qwythos_model(target):
+            # Qwythos-9B-v2 is a Qwen3.5-derived model. The published
+            # Qwen3.5-9B DFlash drafter is architecture-compatible, whereas
+            # no Qwythos-specific DFlare checkpoint is published. Never map an
+            # explicit DFlare request to a different algorithm.
+            if mode == "dflare":
+                return None
+            return "z-lab/Qwen3.5-9B-DFlash"
+        if "qwen3.8" in target and "27b" in target:
+            return "z-lab/Qwen3.8-27B-DFlash2"
+        sizes = ("4b", "8b", "14b", "32b")
+        for size in sizes:
+            if "qwen3" in target and size in target:
+                if mode == "dflare" and size == "4b":
+                    return "AngelSlim/Qwen3-4b-dflare"
+                return f"z-lab/Qwen3-{size.upper()}-DFlash-b16"
+        for size in ("4b", "9b", "27b", "35b", "122b", "397b"):
+            if "qwen3.5" in target and size in target:
+                return f"z-lab/Qwen3.5-{size.upper()}-DFlash"
+        for size in ("27b", "35b"):
+            if "qwen3.6" in target and size in target:
+                return f"z-lab/Qwen3.6-{size.upper()}-DFlash"
+        return None
+
+    def _mlx_speculative_block_size(self):
+        """Return the active drafter width, applying the MLX quantized cap."""
+        if self._spec_draft is None:
+            return None
+        from core.inference.mlx_speculative import (
+            mlx_model_uses_quantized_weights,
+            resolve_speculative_block_size,
+        )
+
+        configured = getattr(self._spec_draft, "config", None)
+        default = getattr(configured, "block_size", None)
+        if default is None:
+            return None
+        requested = (
+            min(int(default), int(self._spec_draft_n_max) + 1)
+            if self._spec_draft_n_max is not None
+            else None
+        )
+        return resolve_speculative_block_size(
+            requested,
+            int(default),
+            quantized=(
+                mlx_model_uses_quantized_weights(
+                    getattr(self._model, "language_model", self._model)
+                )
+                or mlx_model_uses_quantized_weights(self._spec_draft)
+            ),
+        )
+
+    def _load_mlx_vlm_speculative_draft(
+        self,
+        requested,
+        draft_model_path,
+        draft_n_max,
+        hf_token,
+        model_name,
+    ):
+        """Load mlx-vlm's official DFlash drafter for Qwen3.5-derived VLMs."""
+        explicit = bool(draft_model_path and str(draft_model_path).strip())
+        mode = requested
+        draft_id = str(draft_model_path).strip() if explicit else None
+        if draft_id is None:
+            draft_id = os.environ.get("UNSLOTH_MLX_SPEC_DRAFT_MODEL", "").strip() or None
+        if draft_id is None:
+            mode = "dflash"
+            draft_id = self._default_mlx_draft_model(model_name, mode)
+        if requested == "dflare":
+            raise ValueError(
+                "DFlare is not available for MLX VLMs or Qwythos-9B-v2: "
+                "no target-specific Qwythos DFlare checkpoint is published. "
+                "Use DFlash with the matching Qwen3.5-9B drafter, or provide a future compatible DFlare port."
+            )
+        if not draft_id:
+            if requested == "auto":
+                self._speculative_type = "off"
+                self._spec_fallback_reason = "mlx_no_compatible_vlm_draft"
+                return None
+            raise ValueError(
+                f"No built-in MLX VLM {requested} drafter is registered for '{model_name}'. "
+                "Pass spec_draft_model_path with a matching mlx-vlm checkpoint."
+            )
+
+        try:
+            from mlx_vlm.speculative.drafters import (
+                load_drafter,
+                validate_drafter_compatibility,
+            )
+            from core.inference.mlx_speculative import (
+                mlx_model_quantization_bits,
+                mlx_model_uses_quantized_weights,
+            )
+
+            draft, resolved_kind = load_drafter(
+                draft_id,
+                kind=None if requested == "auto" else "dflash",
+                token=hf_token,
+            )
+            if resolved_kind != "dflash":
+                raise ValueError(
+                    f"MLX VLM drafter '{draft_id}' resolves to {resolved_kind!r}; "
+                    "Qwythos compatibility requires a DFlash drafter."
+                )
+            validate_drafter_compatibility(self._model, draft, resolved_kind)
+
+            # Match the official MLX DFlash recipe: a quantized target gets a
+            # group-64 4-bit drafter. Fail open for unusual custom checkpoints.
+            target_lm = getattr(self._model, "language_model", self._model)
+            draft_bits = 4 if mlx_model_uses_quantized_weights(target_lm) and not mlx_model_uses_quantized_weights(draft) else None
+            if draft_bits is not None:
+                try:
+                    from mlx import nn
+                    import mlx.core as mx
+
+                    nn.quantize(draft, group_size=64, bits=draft_bits)
+                    mx.eval(draft.parameters())
+                except Exception as exc:  # noqa: BLE001 -- custom drafts remain usable
+                    logger.warning(
+                        "Could not quantize MLX VLM drafter; using native weights: %s",
+                        exc,
+                    )
+                    draft_bits = None
+
+            self._spec_draft = draft
+            self._speculative_type = resolved_kind
+            self._spec_draft_model_path = draft_id
+            self._spec_draft_bits = draft_bits or mlx_model_quantization_bits(draft)
+            self._spec_draft_n_max = (
+                max(1, min(int(draft_n_max), 16)) if draft_n_max is not None else None
+            )
+            logger.info(
+                "MLX VLM speculative decoding enabled: mode=%s draft=%s block_size=%s draft_bits=%s n_max=%s",
+                resolved_kind,
+                draft_id,
+                getattr(getattr(draft, "config", None), "block_size", None),
+                self._spec_draft_bits,
+                self._spec_draft_n_max,
+            )
+            return draft
+        except Exception as exc:
+            if requested == "auto" and not explicit:
+                logger.warning(
+                    "MLX automatic VLM DFlash selection unavailable for %s (%s); using ordinary decoding",
+                    model_name,
+                    exc,
+                )
+                self._speculative_type = "off"
+                self._spec_fallback_reason = "mlx_vlm_draft_unavailable"
+                return None
+            raise RuntimeError(
+                f"Could not load MLX VLM DFlash drafter '{draft_id}': {exc}"
+            ) from exc
+
+    def _target_spec_dimensions(self):
+        inner = getattr(self._model, "model", self._model)
+        args = getattr(inner, "args", None) or getattr(self._model, "args", None)
+        layers = getattr(inner, "layers", None)
+        hidden_size = getattr(args, "hidden_size", None)
+        vocab_size = getattr(args, "vocab_size", None)
+        if hidden_size is None:
+            hidden_size = getattr(getattr(self._model, "config", None), "hidden_size", None)
+        if vocab_size is None:
+            vocab_size = getattr(getattr(self._model, "config", None), "vocab_size", None)
+        return int(hidden_size) if hidden_size else None, int(vocab_size) if vocab_size else None, len(layers or ())
+
+    def _load_mlx_speculative_draft(
+        self,
+        requested_type,
+        draft_model_path,
+        draft_n_max,
+        hf_token,
+        model_name,
+    ):
+        requested = self._normalize_mlx_speculative_type(requested_type)
+        self._spec_requested_type = requested
+        self._spec_draft_model_path_requested = (
+            str(draft_model_path).strip() if draft_model_path else None
+        )
+        self._spec_fallback_reason = None
+        self._spec_draft = None
+        self._spec_draft_model_path = None
+        self._spec_draft_n_max = None
+        self._spec_draft_bits = None
+
+        if requested in {"off", "mtp", "ngram", "mtp+ngram"}:
+            self._speculative_type = "off"
+            if requested not in {"off", "auto"}:
+                self._spec_fallback_reason = "mlx_speculative_mode_not_supported"
+            return None
+        if requested not in {"auto", "dflash", "dflare"}:
+            raise ValueError(
+                f"Unsupported MLX speculative mode '{requested}'. Use auto, dflash, dflare or off."
+            )
+        if getattr(self, "_is_vlm", False):
+            return self._load_mlx_vlm_speculative_draft(
+                requested,
+                draft_model_path,
+                draft_n_max,
+                hf_token,
+                model_name,
+            )
+
+        explicit = bool(draft_model_path and str(draft_model_path).strip())
+        mode = requested
+        draft_id = str(draft_model_path).strip() if explicit else None
+        if draft_id is None:
+            draft_id = os.environ.get("UNSLOTH_MLX_SPEC_DRAFT_MODEL", "").strip() or None
+        if draft_id is None:
+            if mode == "auto" and draft_id is None:
+                mode = "dflash"
+                draft_id = self._default_mlx_draft_model(model_name, mode)
+            else:
+                draft_id = self._default_mlx_draft_model(model_name, mode)
+        if not draft_id:
+            if requested == "auto":
+                self._speculative_type = "off"
+                self._spec_fallback_reason = "mlx_no_compatible_draft"
+                return None
+            raise ValueError(
+                f"No built-in {requested} drafter is registered for '{model_name}'. "
+                "Pass spec_draft_model_path with a matching MLX-compatible checkpoint."
+            )
+
+        try:
+            from core.inference.mlx_speculative import (
+                load_draft,
+                mlx_model_quantization_bits,
+                mlx_model_uses_quantized_weights,
+            )
+
+            draft = load_draft(draft_id, token=hf_token)
+            # The official DFlash MLX recipe quantizes the drafter when the
+            # target is quantized. This keeps draft matmuls small enough for
+            # Apple Silicon and pairs with the verify-width cap in
+            # mlx_speculative.py. A custom checkpoint may not have dimensions
+            # compatible with MLX's group-64 quantizer, so this optimization is
+            # deliberately fail-open: ordinary native drafting still works.
+            target_is_quantized = mlx_model_uses_quantized_weights(self._model)
+            draft_is_quantized = mlx_model_uses_quantized_weights(draft)
+            draft_bits = 4 if target_is_quantized and not draft_is_quantized else None
+            if draft_bits is not None:
+                try:
+                    from mlx import nn
+                    import mlx.core as mx
+
+                    nn.quantize(draft, group_size=64, bits=draft_bits)
+                    mx.eval(draft.parameters())
+                    logger.info(
+                        "Quantized MLX speculative drafter to %d-bit group-64 weights",
+                        draft_bits,
+                    )
+                except Exception as exc:  # noqa: BLE001 -- custom drafts must remain usable
+                    logger.warning(
+                        "Could not quantize MLX speculative drafter; using native weights: %s",
+                        exc,
+                    )
+                    draft_bits = None
+            draft_arch = str(getattr(draft.config, "model_arch", "dflash")).lower()
+            if requested == "auto" and mode == "auto":
+                # An explicit path or UNSLOTH_MLX_SPEC_DRAFT_MODEL may point
+                # at either architecture; auto must follow the checkpoint,
+                # rather than treating every custom drafter as DFlash.
+                mode = draft_arch
+            target_hidden, target_vocab, target_layers = self._target_spec_dimensions()
+            draft_config = draft.config
+            if target_hidden is not None and int(draft_config.hidden_size) != target_hidden:
+                raise ValueError(
+                    f"draft hidden_size={draft_config.hidden_size} does not match target hidden_size={target_hidden}"
+                )
+            if target_vocab is not None and int(draft_config.vocab_size) != target_vocab:
+                raise ValueError(
+                    f"draft vocab_size={draft_config.vocab_size} does not match target vocab_size={target_vocab}"
+                )
+            if target_layers and any(
+                int(layer_id) >= target_layers for layer_id in draft_config.target_layer_ids
+            ):
+                raise ValueError(
+                    f"draft target_layer_ids={draft_config.target_layer_ids} exceed the target's {target_layers} layers"
+                )
+            if draft_arch != mode:
+                raise ValueError(
+                    f"checkpoint architecture is {getattr(draft_config, 'model_arch', 'dflash')}, not {mode}"
+                )
+            self._spec_draft = draft
+            self._speculative_type = mode
+            self._spec_draft_model_path = draft_id
+            self._spec_draft_bits = draft_bits or mlx_model_quantization_bits(draft)
+            self._spec_draft_n_max = (
+                max(1, min(int(draft_n_max), 16)) if draft_n_max is not None else None
+            )
+            logger.info(
+                "MLX speculative decoding enabled: mode=%s draft=%s block_size=%s draft_bits=%s n_max=%s",
+                mode,
+                draft_id,
+                draft_config.block_size,
+                self._spec_draft_bits,
+                self._spec_draft_n_max,
+            )
+            return draft
+        except Exception as exc:
+            if requested == "auto" and not explicit:
+                logger.warning(
+                    "MLX automatic DFlash selection unavailable for %s (%s); using ordinary decoding",
+                    model_name,
+                    exc,
+                )
+                self._speculative_type = "off"
+                self._spec_fallback_reason = "mlx_draft_unavailable"
+                return None
+            raise RuntimeError(
+                f"Could not load MLX {mode} drafter '{draft_id}': {exc}"
+            ) from exc
+
     def _resolve_kv_policy(self, is_vlm, kv_bits, max_seq_length, served):
         """The quantization status and cache window this load will run with.
 
@@ -2519,12 +2903,16 @@ class MLXInferenceBackend:
         distributed_group = None,
         kv_bits = None,
         chat_template_override = None,
+        speculative_type = None,
+        spec_draft_n_max = None,
+        spec_draft_model_path = None,
     ) -> bool:
         import mlx.core as mx
 
         # Keep the token so the native-template fallback can fetch a gated model's repo template during generation.
         self._hf_token = hf_token
         model_name = config.identifier if hasattr(config, "identifier") else str(config)
+        max_seq_length = mlx_effective_context_length(model_name, max_seq_length)
         is_vision = getattr(config, "is_vision", False)
         distributed_rank, distributed_size = _mlx_distributed_rank_size(distributed_group)
         is_distributed = distributed_group is not None and distributed_size > 1
@@ -2616,6 +3004,14 @@ class MLXInferenceBackend:
             self._tokenizer = tokenizer
             self._processor = None
             self._is_vlm = False
+
+        self._load_mlx_speculative_draft(
+            speculative_type,
+            spec_draft_model_path,
+            spec_draft_n_max,
+            hf_token,
+            model_name,
+        )
 
         _audio_type = _classify_mlx_audio_type(
             model,
@@ -2712,6 +3108,14 @@ class MLXInferenceBackend:
             "mlx_kv_quant_note": self._kv_quant["note"],
             "chat_template_override_requested": self._template_override["requested"],
             "chat_template_override_reason": self._template_override["reason"],
+            "speculative_type": self._speculative_type,
+            "speculative_requested_type": self._spec_requested_type,
+            "spec_drafter_kind": self._speculative_type if self._spec_draft is not None else None,
+            "spec_draft_model_path": self._spec_draft_model_path,
+            "spec_draft_model_path_requested": self._spec_draft_model_path_requested,
+            "spec_draft_bits": self._spec_draft_bits,
+            "spec_draft_n_max": self._spec_draft_n_max,
+            "spec_fallback_reason": self._spec_fallback_reason,
         }
         # Capture chat_template_info for the worker IPC reply and route capability classification.
         self._populate_chat_template_info(model_name, native_template)
@@ -2819,6 +3223,14 @@ class MLXInferenceBackend:
         self._model = None
         self._tokenizer = None
         self._processor = None
+        self._spec_draft = None
+        self._spec_draft_model_path = None
+        self._spec_draft_n_max = None
+        self._spec_draft_bits = None
+        self._speculative_type = "off"
+        self._spec_requested_type = "auto"
+        self._spec_draft_model_path_requested = None
+        self._spec_fallback_reason = None
         self._distributed_group = None
         self._distributed_rank = 0
         self._distributed_world_size = 1
@@ -3077,6 +3489,7 @@ class MLXInferenceBackend:
     ):
         from mlx_lm import stream_generate
         from mlx_lm.sample_utils import make_sampler
+        mlx_speculative_stream = None
 
         from core.inference.chat_template_helpers import detect_think_prefill
 
@@ -3129,6 +3542,25 @@ class MLXInferenceBackend:
             frequency_penalty = frequency_penalty,
             logit_bias = logit_bias,
         )
+        # The native DFlash/DFlare loop has its own target/draft sampling path.
+        # Fall back to mlx-lm whenever a request asks for a processor that the
+        # block verifier cannot reproduce; this preserves the existing sampling
+        # contract instead of silently changing it.
+        use_mlx_speculative = bool(
+            self._spec_draft is not None
+            and not logits_processors
+            and not min_p
+            and seed is None
+            # The native-channel/tool paths consume one token at a time and
+            # have stricter stop/normalization semantics. Keep those on the
+            # established mlx-lm stream; speculative chunks remain for plain
+            # text where their token list can be consumed atomically.
+            and not tools
+            and not tool_protocol_active
+            and reasoning_channel_markers is None
+        )
+        if use_mlx_speculative:
+            from core.inference.mlx_speculative import stream_generate as mlx_speculative_stream
 
         preserve_native_channels = reasoning_channel_markers is not None
         native_token_decoder = (
@@ -3172,13 +3604,25 @@ class MLXInferenceBackend:
             _mlx_fused_moe_gate_up(self._model),
             _mlx_fused_decode_conv_silu(self._model),
         ):
-            (
-                gen_prompt,
-                prompt_cache,
-                cache_key,
-                prompt_tokens,
-                cached_n,
-            ) = self._prepare_prompt_cache(prompt, _adapter_state)
+            if use_mlx_speculative:
+                # The target and draft caches must advance and roll back as one
+                # speculative transaction. The ordinary prefix-cache snapshots
+                # contain only target state, so do not mix them into this path.
+                gen_prompt, prompt_cache, cache_key, prompt_tokens, cached_n = (
+                    prompt,
+                    None,
+                    None,
+                    None,
+                    0,
+                )
+            else:
+                (
+                    gen_prompt,
+                    prompt_cache,
+                    cache_key,
+                    prompt_tokens,
+                    cached_n,
+                ) = self._prepare_prompt_cache(prompt, _adapter_state)
             if max_new_tokens is None:
                 max_new_tokens = self._unset_generation_budget(prompt, prompt_tokens)
             logger.info(
@@ -3194,24 +3638,42 @@ class MLXInferenceBackend:
                 # Enter request-scoped model state before yielding any response.
                 if think_prefix:
                     yield think_prefix
-                gen_kwargs = dict(
-                    prompt = gen_prompt,
-                    max_tokens = max_new_tokens,
-                    sampler = sampler,
-                )
-                gen_kwargs.update(self._kv_quant_generate_kwargs())
-                gen_kwargs.update(self._kv_window_generate_kwargs())
-                if prompt_cache is not None:
-                    gen_kwargs["prompt_cache"] = prompt_cache
-                if logits_processors is not None:
-                    gen_kwargs["logits_processors"] = logits_processors
-                for response in stream_generate(
-                    self._model,
-                    self._tokenizer,
-                    **gen_kwargs,
-                ):
+                if use_mlx_speculative:
+                    response_stream = mlx_speculative_stream(
+                        self._model,
+                        self._spec_draft,
+                        self._tokenizer,
+                        gen_prompt,
+                        block_size=self._mlx_speculative_block_size(),
+                        max_tokens=int(max_new_tokens),
+                        temperature=float(temperature or 0.0),
+                        top_p=float(top_p or 1.0),
+                        top_k=int(top_k or 0),
+                        max_kv_size=self._kv_cache_window,
+                    )
+                else:
+                    gen_kwargs = dict(
+                        prompt = gen_prompt,
+                        max_tokens = max_new_tokens,
+                        sampler = sampler,
+                    )
+                    gen_kwargs.update(self._kv_quant_generate_kwargs())
+                    gen_kwargs.update(self._kv_window_generate_kwargs())
+                    if prompt_cache is not None:
+                        gen_kwargs["prompt_cache"] = prompt_cache
+                    if logits_processors is not None:
+                        gen_kwargs["logits_processors"] = logits_processors
+                    response_stream = stream_generate(
+                        self._model,
+                        self._tokenizer,
+                        **gen_kwargs,
+                    )
+                for response in response_stream:
                     final_response = response
-                    token_ids.append(response.token)
+                    if use_mlx_speculative:
+                        token_ids.extend(getattr(response, "tokens", ()) or ())
+                    else:
+                        token_ids.append(response.token)
                     if preserve_native_channels:
                         _tok = native_token_decoder.decode_stream_token(
                             response.token, getattr(response, "text", None) or ""
@@ -3301,6 +3763,18 @@ class MLXInferenceBackend:
                             _mlx_stop_token_ids(self._tokenizer, self._model),
                             getattr(final_response, "generation_tokens", 0),
                             max_new_tokens,
+                        ),
+                        speculative=(
+                            {
+                                "mode": self._speculative_type,
+                                "draft_model": self._spec_draft_model_path,
+                                "draft_tokens": getattr(final_response, "draft_tokens", 0),
+                                "accepted_tokens": getattr(final_response, "accepted_tokens", 0),
+                                "steps": getattr(final_response, "speculative_steps", 0),
+                                "used": True,
+                            }
+                            if use_mlx_speculative
+                            else None
                         ),
                     )
         # The turn's settled text: delivered once for the plain path, as the tail for the native-channel one. Every
@@ -3567,6 +4041,25 @@ class MLXInferenceBackend:
         elif _rep_active:
             vlm_kwargs["repetition_penalty"] = float(repetition_penalty)
 
+        # mlx-vlm's native DFlash loop is exact for plain generation, but the
+        # app's tool/native-control decoder and custom logits processors have
+        # additional streaming semantics. Keep those established paths intact
+        # and use speculation for the ordinary text/image request.
+        use_vlm_speculative = bool(
+            self._spec_draft is not None
+            and not tools
+            and not tool_protocol_active
+            and seed is None
+            and not presence_penalty
+            and not frequency_penalty
+            and not logit_bias
+            and not _rep_active
+        )
+        if use_vlm_speculative:
+            vlm_kwargs["draft_model"] = self._spec_draft
+            vlm_kwargs["draft_kind"] = self._speculative_type
+            vlm_kwargs["draft_block_size"] = self._mlx_speculative_block_size()
+
         # Same provenance the text path recovers: mlx-vlm's ``response.text`` has dropped the
         # native tool controls, so a genuine wrapped call would reach the parser markerless and
         # be refused. Text-only requests on a VLM come here too, and reasoning delimiters that
@@ -3709,6 +4202,16 @@ class MLXInferenceBackend:
                                 stop_ids,
                                 getattr(final_response, "generation_tokens", 0),
                                 max_new_tokens,
+                            ),
+                            speculative=(
+                                {
+                                    "mode": self._speculative_type,
+                                    "draft_model": self._spec_draft_model_path,
+                                    **_mlx_speculative_counters(self._spec_draft),
+                                    "used": use_vlm_speculative,
+                                }
+                                if use_vlm_speculative
+                                else None
                             ),
                         )
 

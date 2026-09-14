@@ -74,6 +74,12 @@ import {
 } from "@/features/hub/inventory";
 import { modelIdsMatch } from "@/features/hub/lib/model-identity";
 import { DeleteChatFilesSwitch } from "./components/delete-chat-files-switch";
+import { ChatPlanPanel } from "./components/chat-plan-panel";
+import {
+  CHAT_WORKSPACE_OPEN_EVENT,
+  ChatWorkspacePanel,
+  openChatWorkspace,
+} from "./components/chat-workspace-panel";
 import { chatLocalModelOptions } from "./local-model-options";
 import {
   type NativeIntent,
@@ -145,6 +151,7 @@ import {
   ResearchActivitySheet,
 } from "./components/research-activity-panel";
 import { ChatModelNotice } from "./components/chat-model-notice";
+import { ChatGoalProgressRow } from "./components/chat-goal-progress-row";
 import {
   chatModelSwitchMeta,
   type ChatModelSwitchTarget,
@@ -362,6 +369,12 @@ const SingleContent = memo(function SingleContent({
     useState(false);
   const [isArtifactSurfaceVisible, setIsArtifactSurfaceVisible] =
     useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  useEffect(() => {
+    const openWorkspace = () => setWorkspaceOpen(true);
+    window.addEventListener(CHAT_WORKSPACE_OPEN_EVENT, openWorkspace);
+    return () => window.removeEventListener(CHAT_WORKSPACE_OPEN_EVENT, openWorkspace);
+  }, []);
   const researchMatchesThread = Boolean(
     openResearchThreadId &&
       openResearchThreadId === (threadId ?? activeThreadId),
@@ -375,7 +388,13 @@ const SingleContent = memo(function SingleContent({
         ? !artifact.threadId || artifact.threadId === threadId
         : Boolean(artifact.threadId && artifact.threadId === activeThreadId)),
   );
-  const showContextPanel = showResearchPanel || showArtifactPanel;
+  const chatMode = useChatRuntimeStore((state) => state.chatMode);
+  const showPlanPanel =
+    chatMode === "plan" && !isMobile && !showResearchPanel && !showArtifactPanel;
+  const showWorkspacePanel =
+    workspaceOpen && !isMobile && !showResearchPanel && !showArtifactPanel && !showPlanPanel;
+  const showContextPanel =
+    showResearchPanel || showArtifactPanel || showPlanPanel || showWorkspacePanel;
 
   const artifactLayoutActive = showContextPanel || isArtifactPanelLayoutActive;
   const artifactPanelSettledOpen =
@@ -439,6 +458,7 @@ const SingleContent = memo(function SingleContent({
       <Thread hideWelcome={Boolean(threadId)} targetThreadId={threadId} />
     </div>
   );
+  const goalThreadId = threadId ?? activeThreadId ?? null;
 
   return (
     <>
@@ -456,6 +476,7 @@ const SingleContent = memo(function SingleContent({
           className="h-full min-h-0 min-w-0 overflow-hidden"
         >
           <div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden">
+            <ChatGoalProgressRow threadId={goalThreadId} />
             {threadPane}
           </div>
         </ResizablePanel>
@@ -485,7 +506,7 @@ const SingleContent = memo(function SingleContent({
                 ? "58%"
                 : "0%"
           }
-          collapsible={showArtifactPanel}
+          collapsible={showArtifactPanel || showPlanPanel || showWorkspacePanel}
           collapsedSize="0%"
           className={cn(
             "h-full min-h-0 min-w-0 overflow-visible",
@@ -508,7 +529,7 @@ const SingleContent = memo(function SingleContent({
                  onClose={closeResearchPanel}
                />
              ) : showArtifactPanel && artifact ? (
-              <ArtifactSurface
+               <ArtifactSurface
                 artifact={artifact}
                 variant="panel"
                 onClose={onCloseArtifact}
@@ -516,7 +537,17 @@ const SingleContent = memo(function SingleContent({
                   openArtifact(artifact, { surface: "overlay" })
                 }
               />
-            ) : null}
+             ) : showPlanPanel ? (
+               <ChatPlanPanel
+                 threadId={goalThreadId}
+                 onClose={() => useChatRuntimeStore.getState().setChatMode("normal")}
+               />
+             ) : showWorkspacePanel ? (
+               <ChatWorkspacePanel
+                 threadId={goalThreadId}
+                 onClose={() => setWorkspaceOpen(false)}
+               />
+             ) : null}
           </div>
         </ResizablePanel>
       </ResizablePanelGroup>
@@ -4148,6 +4179,27 @@ export function ChatPage({
                 </TooltipContent>
               </Tooltip>
             ) : null}
+            {view.mode === "single" && (
+              <Tooltip>
+                <TooltipPrimitive.Trigger asChild={true}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      closeArtifactSurface();
+                      useResearchRunStore.getState().closePanel();
+                      openChatWorkspace();
+                    }}
+                    className="flex size-[30px] cursor-pointer items-center justify-center rounded-[10px] text-nav-fg transition-colors hover:bg-nav-surface-hover hover:text-black dark:hover:text-white focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    aria-label="Open workspace"
+                  >
+                    <HugeiconsIcon icon={LayoutAlignRightIcon} strokeWidth={1.75} className="size-icon" />
+                  </button>
+                </TooltipPrimitive.Trigger>
+                <TooltipContent side="bottom" sideOffset={6} className="tooltip-compact">
+                  Workspace: outputs, background, sources, subagents
+                </TooltipContent>
+              </Tooltip>
+            )}
             {!settingsOpen && (
               <Tooltip>
                 <TooltipPrimitive.Trigger asChild={true}>

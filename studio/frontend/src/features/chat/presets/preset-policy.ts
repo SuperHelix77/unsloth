@@ -345,6 +345,7 @@ export function resolveLoadMaxSeqLength({
   pinnedMaxSeqLength,
   defaultMaxSeqLength,
   presetSource,
+  preferNativeContext = false,
 }: {
   modelId: string;
   ggufVariant?: string | null;
@@ -357,6 +358,8 @@ export function resolveLoadMaxSeqLength({
   pinnedMaxSeqLength: number | null;
   defaultMaxSeqLength: number;
   presetSource: ChatPresetSource;
+  /** When true, an Auto Qwen3.8 Mac reload must not replay a previous fit result as a request. */
+  preferNativeContext?: boolean;
 }): number {
   const isDirectGgufFile = modelId.toLowerCase().endsWith(".gguf");
   const isGgufLoad = isGguf === true || ggufVariant != null || isDirectGgufFile;
@@ -371,7 +374,7 @@ export function resolveLoadMaxSeqLength({
   if (isGgufLoad && presetSource === "builtin-default") {
     return 0;
   }
-  if (isReloadingCurrentGguf) {
+  if (isReloadingCurrentGguf && !preferNativeContext) {
     return loadedContextLength ?? 0;
   }
   if (isGgufLoad) {

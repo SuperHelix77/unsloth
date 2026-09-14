@@ -327,6 +327,10 @@ from hub.utils.download_registry import (
 )
 from routes.settings import router as settings_router
 from routes.prompts import router as prompts_router
+from routes.skills import router as skills_router
+from routes.learning import router as learning_router
+from routes.self_training import router as self_training_router
+from routes.memory import router as memory_router
 from routes.profile_stats import router as profile_stats_router
 from auth import policy as auth_policy, storage
 from auth.authentication import get_current_subject
@@ -1459,6 +1463,9 @@ app.include_router(settings_router, prefix = "/api/settings", tags = ["settings"
 app.include_router(mcp_servers_router, prefix = "/api/mcp/servers", tags = ["mcp"])
 app.include_router(skills_router, prefix = "/api/skills", tags = ["skills"])
 app.include_router(prompts_router, prefix = "/api/prompts", tags = ["prompts"])
+app.include_router(learning_router, prefix = "/api/learning", tags = ["learning"])
+app.include_router(self_training_router, prefix = "/api/self-training", tags = ["self-training"])
+app.include_router(memory_router, prefix = "/api/memory", tags = ["memory"])
 app.include_router(profile_stats_router, prefix = "/api/profile", tags = ["profile"])
 app.include_router(datasets_router, prefix = "/api/datasets", tags = ["datasets"])
 app.include_router(data_recipe_router, prefix = "/api/data-recipe", tags = ["data-recipe"])

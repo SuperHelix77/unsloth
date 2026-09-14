@@ -480,6 +480,9 @@ def _handle_load(backend, config: dict, resp_queue: Any) -> None:
                 load_kwargs["distributed_group"] = config.get("_mlx_distributed_group")
                 load_kwargs["kv_bits"] = config.get("mlx_kv_bits")
                 load_kwargs["chat_template_override"] = config.get("chat_template_override")
+                load_kwargs["speculative_type"] = config.get("speculative_type")
+                load_kwargs["spec_draft_n_max"] = config.get("spec_draft_n_max")
+                load_kwargs["spec_draft_model_path"] = config.get("spec_draft_model_path")
             success = backend.load_model(**load_kwargs)
         finally:
             heartbeat_stop.set()
@@ -539,6 +542,21 @@ def _handle_load(backend, config: dict, resp_queue: Any) -> None:
                         "mlx_kv_quant_note",
                         "chat_template_override_requested",
                         "chat_template_override_reason",
+                    )
+                    if k in _entry
+                }
+            )
+            model_info.update(
+                {
+                    k: _entry[k]
+                    for k in (
+                        "speculative_type",
+                        "speculative_requested_type",
+                        "spec_drafter_kind",
+                        "spec_draft_model_path_requested",
+                        "spec_draft_bits",
+                        "spec_draft_n_max",
+                        "spec_fallback_reason",
                     )
                     if k in _entry
                 }
@@ -1044,6 +1062,52 @@ def _handle_unload(backend, cmd: dict, resp_queue: Any) -> None:
         )
 
 
+def _handle_adapter_hotswap(backend, cmd: dict, resp_queue: Any) -> None:
+    """Load and activate one LoRA adapter without replacing the base worker."""
+    request_id = cmd.get("request_id", "")
+    base_model = cmd.get("base_model_name") or backend.active_model_name
+    adapter_path = cmd.get("adapter_path")
+    adapter_name = cmd.get("adapter_name")
+    try:
+        if not base_model or not adapter_path or not adapter_name:
+            raise RuntimeError("An active base model, adapter path, and adapter name are required")
+        if not hasattr(backend, "load_adapter") or not hasattr(backend, "set_active_adapter"):
+            raise RuntimeError("Live adapter hotswap is unavailable for this inference backend")
+        if not backend.load_adapter(base_model, adapter_path, adapter_name):
+            raise RuntimeError("The adapter could not be loaded onto the active base model")
+        if not backend.set_active_adapter(base_model, adapter_name):
+            raise RuntimeError("The adapter loaded but could not be activated")
+        _send_response(
+            resp_queue,
+            {"type": "adapter_hotswap", "request_id": request_id, "base_model": base_model, "adapter_name": adapter_name},
+        )
+    except Exception as exc:
+        _send_response(
+            resp_queue,
+            {"type": "adapter_hotswap", "request_id": request_id, "error": str(exc)},
+        )
+
+
+def _handle_adapter_revert(backend, cmd: dict, resp_queue: Any) -> None:
+    """Disable/remove the active LoRA while retaining the loaded base worker."""
+    request_id = cmd.get("request_id", "")
+    base_model = cmd.get("base_model_name") or backend.active_model_name
+    try:
+        if not base_model or not hasattr(backend, "revert_to_base_model"):
+            raise RuntimeError("Live adapter revert is unavailable for this inference backend")
+        if not backend.revert_to_base_model(base_model):
+            raise RuntimeError("The active adapter could not be reverted")
+        _send_response(
+            resp_queue,
+            {"type": "adapter_revert", "request_id": request_id, "base_model": base_model},
+        )
+    except Exception as exc:
+        _send_response(
+            resp_queue,
+            {"type": "adapter_revert", "request_id": request_id, "error": str(exc)},
+        )
+
+
 def run_inference_process(
     *,
     cmd_queue: Any,
@@ -1264,6 +1328,10 @@ def run_inference_process(
                     _handle_load(backend, cmd, resp_queue)
                 elif cmd_type == "unload":
                     _handle_unload(backend, cmd, resp_queue)
+                elif cmd_type == "adapter_hotswap":
+                    _handle_adapter_hotswap(backend, cmd, resp_queue)
+                elif cmd_type == "adapter_revert":
+                    _handle_adapter_revert(backend, cmd, resp_queue)
                 elif cmd_type == "cancel":
                     cancel_event.set()
                 elif cmd_type == "reset":
@@ -1527,6 +1595,12 @@ def run_inference_process(
 
             elif cmd_type == "unload":
                 _handle_unload(backend, cmd, resp_queue)
+
+            elif cmd_type == "adapter_hotswap":
+                _handle_adapter_hotswap(backend, cmd, resp_queue)
+
+            elif cmd_type == "adapter_revert":
+                _handle_adapter_revert(backend, cmd, resp_queue)
 
             elif cmd_type == "cancel":
                 # Redundant with mp.Event but handle gracefully.

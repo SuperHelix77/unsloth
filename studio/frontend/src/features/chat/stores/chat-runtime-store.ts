@@ -94,6 +94,7 @@ import {
   isThreadOwnedSettingKey,
   isThreadScopedParamKey,
   normalizeSavedThreadScopedSettings,
+  resolveChatModeForThread,
   sanitizeThreadScopedSettings,
 } from "../utils/thread-scoped-settings";
 import {
@@ -103,6 +104,7 @@ import {
 import { shouldAdvanceQueuedSettingsEpoch } from "../utils/queued-settings-epoch";
 import type { MmprojFallbackReason } from "../types/api";
 import type { ResearchWebsitePolicy } from "../types/research";
+import { DEFAULT_CHAT_MODE, type ChatMode } from "../lib/chat-mode";
 import {
   CHAT_GPU_MEMORY_MODE_KEY,
   CHAT_SPECULATIVE_TYPE_KEY,
@@ -144,6 +146,7 @@ export const MODELS_FIT_ON_DEVICE_ONLY_KEY =
   "unsloth_models_fit_on_device_only";
 export const CHAT_BYPASS_PERMISSIONS_KEY = "unsloth_chat_bypass_permissions";
 export const CHAT_PERMISSION_MODE_KEY = "unsloth_chat_permission_mode";
+export const CHAT_MODE_KEY = "unsloth_chat_mode";
 
 /** Local tool-call gate: "ask" every call, "auto" only high-risk ones, "off" never but keeps the
  *  sandbox, "full" drops both and is session-only. */
@@ -734,6 +737,7 @@ const MIRRORED_SETTINGS = {
         ? loadPermissionMode()
         : undefined,
   },
+  chatMode: { storageKey: CHAT_MODE_KEY, ...STRING_SETTING },
   ragSource: { storageKey: CHAT_RAG_SOURCE_KEY, ...JSON_SETTING },
   ragMode: { storageKey: CHAT_RAG_MODE_KEY, ...STRING_SETTING },
   ragTopK: { storageKey: CHAT_RAG_TOP_K_KEY, ...NUMBER_SETTING },
@@ -1047,6 +1051,16 @@ function buildThreadScopedSnapshot(
 ): ThreadScopedSettings {
   const settings =
     snapshot ?? readThreadScopedSettings(useChatRuntimeStore.getState());
+  // Goal state is maintained by chat-goal-store rather than the live runtime controls. Preserve
+  // the stored goal while replacing the rest of the snapshot, otherwise a sampling/pill edit
+  // would silently erase the Plan -> Goal lifecycle.
+  if (
+    threadId === threadScopedSettingsThreadId &&
+    settings.goal === undefined &&
+    activeThreadScopedSettings?.goal !== undefined
+  ) {
+    settings.goal = activeThreadScopedSettings.goal;
+  }
   // The write replaces the row and the sanitizer drops a live "full", so any pill toggled
   // under Full access would otherwise erase the chat's stored level.
   if (
@@ -1854,6 +1868,7 @@ export function normalizeSpeculativeType(
   if (s === "mtp" || s === "draft-mtp") return "mtp";
   if (s === "dspark" || s === "draft-dspark") return "dspark";
   if (s === "dflash" || s === "draft-dflash") return "dflash";
+  if (s === "dflare" || s === "draft-dflare") return "dflare";
   if (s === "ngram" || s === "ngram-mod" || s === "ngram-simple") {
     return "ngram";
   }
@@ -2280,6 +2295,8 @@ type ChatRuntimeStore = {
   /** Permission level. Single source of truth for the bypass dropdowns; bypassPermissions and
    *  confirmToolCalls mirror it. "full" is session-only. */
   permissionMode: PermissionMode;
+  /** Installation-wide interaction mode. Plan suppresses tool dispatch; Goal keeps work focused. */
+  chatMode: ChatMode;
   /** Whether the bypass warning dialog is open. Lifted out of the composer menu so confirming
    *  it does not leave the menu frozen. */
   bypassConfirmOpen: boolean;
@@ -2541,6 +2558,7 @@ type ChatRuntimeStore = {
   setConfirmToolCalls: (enabled: boolean) => void;
   setBypassPermissions: (enabled: boolean) => void;
   setPermissionMode: (mode: PermissionMode) => void;
+  setChatMode: (mode: ChatMode) => void;
   setBypassConfirmOpen: (open: boolean) => void;
   allowToolAlways: (sessionId: string, toolName: string) => void;
   setToolConfirmation: (
@@ -2656,6 +2674,7 @@ type ScalarSettingKey =
   | "mcpEnabledForChat"
   | "confirmToolCalls"
   | "permissionMode"
+  | "chatMode"
   | "ragSource"
   | "ragMode"
   | "ragTopK"
@@ -2709,6 +2728,7 @@ const SCALAR_SETTING_KEYS = [
   "mcpEnabledForChat",
   "confirmToolCalls",
   "permissionMode",
+  "chatMode",
   "ragSource",
   "ragMode",
   "ragTopK",
@@ -3967,6 +3987,10 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
   // confirmation gate, so it needs the warning dialog each session.
   bypassPermissions: false,
   permissionMode: INITIAL_PERMISSION_MODE,
+  chatMode: (() => {
+    const raw = readStorageValue(CHAT_MODE_KEY);
+    return raw === "plan" || raw === "goal" ? raw : DEFAULT_CHAT_MODE;
+  })(),
   bypassConfirmOpen: false,
   alwaysAllowToolsBySession: new Map<string, Set<string>>(),
   toolConfirmations: {},
@@ -4783,16 +4807,20 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
           stored?.[key],
           globalThreadScopedDefaults?.[key],
         );
-        if (value === undefined) continue;
-        applied[key] = value;
-        if (isSameThreadScopedValue(value, readThreadScopedValue(state, key))) {
+        const resolvedValue =
+          key === "chatMode"
+            ? resolveChatModeForThread(stored, (value as ChatMode) ?? DEFAULT_CHAT_MODE)
+            : value;
+        if (resolvedValue === undefined) continue;
+        applied[key] = resolvedValue;
+        if (isSameThreadScopedValue(resolvedValue, readThreadScopedValue(state, key))) {
           continue;
         }
         // The sampling ones are one object, gathered and applied together below.
         if (isThreadScopedParamKey(key)) {
-          paramsPatch[key] = value;
+          paramsPatch[key] = resolvedValue;
         } else {
-          target[key] = value;
+          target[key] = resolvedValue;
         }
       }
       if (hasKeys(paramsPatch)) {
@@ -5179,6 +5207,14 @@ export const useChatRuntimeStore = create<ChatRuntimeStore>((set, get) => ({
         permissionMode,
         bypassPermissions: false,
         confirmToolCalls,
+        queuedSettingsEpoch: state.queuedSettingsEpoch + 1,
+      };
+    }),
+  setChatMode: (chatMode) =>
+    set((state) => {
+      saveString(CHAT_MODE_KEY, chatMode);
+      return {
+        chatMode,
         queuedSettingsEpoch: state.queuedSettingsEpoch + 1,
       };
     }),

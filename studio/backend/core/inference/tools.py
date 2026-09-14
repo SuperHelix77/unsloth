@@ -4339,6 +4339,8 @@ def _render_html_reaches_network(arguments: dict) -> bool:
 _ALWAYS_SAFE_TOOLS = frozenset(
     {
         "web_search",
+        "github_context",
+        "inference_performance",
         "search_knowledge_base",
         "search_conversation",
         "read_skill",
@@ -4390,6 +4392,10 @@ def is_potentially_unsafe_tool_call(name: str, arguments: dict) -> bool:
     # CSP when artifact network access is enabled.
     if name == "render_html":
         return _render_html_reaches_network(arguments)
+    if name == "computer":
+        # A screenshot is read-only; all other actions can move focus or enter
+        # data and must remain behind the approval boundary.
+        return str(arguments.get("action") or "").strip().lower() != "screenshot"
     if name.startswith(MCP_TOOL_PREFIX):
         tool_name = name.split("__", 2)[-1]
         if tool_name in _BLENDER_CLI_SUMMARY_TOOLS:
@@ -6487,6 +6493,8 @@ def is_high_risk_tool_call(name: str, arguments: dict) -> bool:
     if name == "render_html":
         # A static canvas is fine; only a networked canvas can egress.
         return _render_html_reaches_network(arguments)
+    if name == "computer":
+        return str(arguments.get("action") or "").strip().lower() != "screenshot"
     if name.startswith(MCP_TOOL_PREFIX):
         tool_name = name.split("__", 2)[-1]
         if tool_name in _BLENDER_CLI_SUMMARY_TOOLS:
@@ -9417,6 +9425,95 @@ WEB_SEARCH_TOOL = {
 }
 
 
+GITHUB_CONTEXT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "github_context",
+        "description": (
+            "Read linked GitHub repositories and ledgers through the user's authenticated GitHub CLI. "
+            "Use this whenever the user asks to inspect 'my GitHub', a GitHub repo, future ledger, v1.1, "
+            "MTP, DFlash, or DFlare. Resolve the repository from local git remotes or the account; do not "
+            "ask the user for a URL. This tool is read-only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "repository": {
+                    "type": "string",
+                    "description": "Optional owner/name repository. Omit to resolve automatically.",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "What to find, such as 'future ledger v1.1 MTP'.",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional repository-relative file path to read.",
+                },
+                "ref": {
+                    "type": "string",
+                    "description": "Optional branch or tag; defaults to the repository default branch.",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "Maximum returned characters, from 2000 to 60000.",
+                },
+            },
+            "required": [],
+        },
+    },
+}
+
+
+INFERENCE_PERFORMANCE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "inference_performance",
+        "description": (
+            "Read the current local llama-server performance and acceleration state. "
+            "Use this for speed questions or /speed. Reports actual context, tok/s, "
+            "requested and engaged speculative modes, and accepted draft tokens. Read-only."
+        ),
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+
+COMPUTER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "computer",
+        "description": (
+            "Interact with the Mac running Unsloth Studio using one explicit action. "
+            "Use screenshot first when the task depends on visible UI. Coordinates are "
+            "screen coordinates. click, type, key, scroll, and open_app always require "
+            "the user's approval; screenshot is read-only. This tool never runs shell "
+            "commands or arbitrary scripts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["screenshot", "click", "type", "key", "scroll", "open_app"],
+                },
+                "x": {"type": "integer", "description": "Screen x coordinate for click."},
+                "y": {"type": "integer", "description": "Screen y coordinate for click."},
+                "text": {"type": "string", "description": "Text to type, maximum 8000 characters."},
+                "key": {"type": "string", "description": "Named key such as return, escape, tab, or left."},
+                "modifiers": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["command", "shift", "option", "control"]},
+                },
+                "amount": {"type": "integer", "description": "Scroll steps from -20 to 20."},
+                "app": {"type": "string", "description": "macOS application name for open_app."},
+            },
+            "required": ["action"],
+        },
+    },
+}
+
+
 def web_search_tool_with_images() -> dict:
     # web_search plus image_queries, offered while the Search images setting is on.
     tool = copy.deepcopy(WEB_SEARCH_TOOL)
@@ -9903,6 +10000,9 @@ CREATE_SKILL_TOOL = {
 
 ALL_TOOLS = [
     WEB_SEARCH_TOOL,
+    GITHUB_CONTEXT_TOOL,
+    INFERENCE_PERFORMANCE_TOOL,
+    COMPUTER_TOOL,
     PYTHON_TOOL,
     TERMINAL_TOOL,
     EDIT_FILE_TOOL,
@@ -10355,6 +10455,26 @@ def execute_tool(
             ),
             name,
         )
+    if name == "github_context":
+        from .github_context import read_github_context
+
+        try:
+            result = read_github_context(
+                arguments,
+                timeout=effective_timeout if effective_timeout is not None else _EXEC_TIMEOUT,
+                cancel_event=cancel_event,
+            )
+        except Exception as exc:  # noqa: BLE001 -- return a model-readable tool error
+            result = f"Error: {exc}"
+        return _fit_result_to_room(result, name)
+    if name == "computer":
+        from .computer_use import use_computer
+
+        return _fit_result_to_room(use_computer(arguments, session_id=session_id), name)
+    if name == "inference_performance":
+        from .runtime_performance import read_local_inference_performance
+
+        return _fit_result_to_room(read_local_inference_performance(), name)
     # Both run with the session's sandbox as cwd, so a chat deleted mid-call must not unlink it from under them.
     if name == "python":
         with _session_in_flight(session_id):

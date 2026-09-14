@@ -1,427 +1,347 @@
-<h1 align="center" style="margin:0;">
-  <a href="https://unsloth.ai/docs"><picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/unslothai/unsloth/main/images/unsloth%20logo%20white%20text.png">
-    <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/unslothai/unsloth/main/images/unsloth%20logo%20black%20text.png">
-    <img alt="Unsloth logo" src="https://raw.githubusercontent.com/unslothai/unsloth/main/images/unsloth%20logo%20black%20text.png" height="80" style="max-width:100%;">
-  </picture></a>
-</h1>
-<h3 align="center" style="margin: 0; margin-top: 0;">
-Unsloth is the first desktop app to run and train models.
-</h3>
+# Unsloth Helix
 
-<p align="center">
-  <a href="#-features">Features</a> •
-  <a href="#-get-started">Quickstart</a> •
-  <a href="#-free-notebooks">Notebooks</a> •
-  <a href="https://unsloth.ai/docs">Documentation</a>
-</p>
+**A local-first, self-improving agent harness built on top of Unsloth Studio.**
 
-<p align="center">
-  <a href="https://unsloth.ai/docs/desktop">
-    <img height="400" alt="unsloth desktop" src="https://unsloth.ai/cgi/image/unsloth_qwen3.8_final_ut2eqWnYJ-SLmu0s7x522.png?format=raw" />
-  </a>
-</p>
+> **Beta / research preview**
+>
+> Unsloth Helix is under active development. The agent, memory, self-learning, QLoRA, speculative-decoding, and computer-use paths are experimental. Expect rough edges, incomplete platform coverage, and behavior changes between commits. Do not use this beta for unattended destructive work or production-critical automation without your own validation, backups, and permission controls.
 
-## ⚡ Get started
-Download the native Unsloth Desktop app for your operating system:
-<table>
-  <tr>
-    <td><b>Platform</b></td>
-    <td><b>Link</b></td>
-  </tr>
-  <tr>
-    <td><b>Windows</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Windows.exe'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>macOS</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-MacOS.dmg'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>Linux / Ubuntu (deb)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Ubuntu.deb'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>Linux (AppImage)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Linux.AppImage'>Download</a></td>
-  </tr>
-</table>
+Unsloth Helix is a community fork of [Unsloth](https://github.com/unslothai/unsloth) that turns the existing local inference and training stack into a persistent coding and research agent.
 
-Download from [Unsloth](https://unsloth.ai/download) or [GitHub Releases](https://github.com/unslothai/unsloth/releases).
+The primary development target is **Qwen3.8-27B on Apple Silicon**. Helix combines a Mac-focused long-context runtime profile with durable Goal/Plan execution, local memory, self-improving skills, benchmark-gated QLoRA adaptation, speculative decoding, GitHub-aware workflows, and macOS computer use.
 
-Or if you prefer to install manually:
+The repository is intended to be understandable and usable on its own. No separate private research repository is required to understand the architecture or operate the public Helix features.
 
-#### macOS, Linux, WSL:
+Current development branch: `codex/unsloth-helix-27b-harness`
+
+## What Helix adds
+
+Helix currently adds these experimental capabilities on top of upstream Unsloth Studio:
+
+- **Persistent Goal and Plan modes** for long-running work instead of one-shot chat.
+- **Helix 27B Mac runtime profile** for Qwen3.8-27B, including a 64K automatic context target, unified-memory-aware settings, quantized KV defaults, single-slot decode, and larger prefill batches when the profile applies.
+- **Speculative decoding lanes** with MTP and DFlash-family support, target-aware selection, and ordinary-decoding fallback when a compatible accelerator is unavailable.
+- **Local memory** through optional Mem0 integration plus a bounded local task-ledger fallback.
+- **Hermes-style procedural learning** that prefers reusable skills before model-weight updates.
+- **On-the-fly skill creation** for recurring procedures, staged as inspectable plain-text `SKILL.md` files.
+- **Self-QLoRA candidate training** with external benchmark comparison, hot-swap, rejection, and rollback.
+- **A learning router** that can choose between memory, a reusable skill, a runtime repair, QLoRA, or no durable change.
+- **Codex / Claude-compatible local skills** and dynamic `/skill-name` commands.
+- **GitHub-aware repository context** and a bundled read-only GitHub MCP configuration for Codex workflows.
+- **macOS computer use** with screenshot, click, type, key, scroll, and app-opening primitives. Mutating actions are permission-gated.
+- **Workspace visibility** for Outputs, Background work, Sources, and Subagents.
+- **Measured runtime reporting** through `/speed`, so speculative decoding is distinguished from ordinary target decode.
+
+The design is intentionally modular. A feature should be independently disableable, measurable, and replaceable without turning the whole local-model stack into a monolith.
+
+## Design philosophy
+
+Helix follows a simple rule: **replace expensive or limiting modules behind stable interfaces instead of rewriting the entire system**.
+
+That gives every optimization a clean baseline, a kill switch, and a measurable effect. If a faster path is unsupported or fails, Helix should preserve a working ordinary path rather than hide the fallback or claim an unmeasured speedup.
+
+The same principle is used for learning. Not every mistake deserves weight updates:
+
+```text
+experience
+    |
+    +--> factual / episodic information ------> local memory
+    |
+    +--> repeatable procedure ----------------> durable skill
+    |
+    +--> novel procedure needed now ----------> ephemeral skill draft
+    |
+    +--> recurring model-level behavior gap --> QLoRA challenger
+    |
+    +--> infrastructure problem --------------> runtime repair
+    |
+    `--> noise / one-off ----------------------> learn nothing
+```
+
+## Architecture
+
+```mermaid
+flowchart TD
+    U[User / Goal] --> GP[Goal + Plan runtime]
+    GP --> M[Local model]
+    M --> T[Tools / Git / shell / computer use]
+    M --> C[Context + skill resolver]
+    M --> MEM[Local memory]
+    MEM --> LR[Learning router]
+    T --> LR
+    LR --> SK[Durable skills]
+    LR --> ES[Ephemeral skill drafts]
+    LR --> QL[QLoRA challenger]
+    LR --> RF[Runtime repair]
+    QL --> B[Held-out benchmark gate]
+    B -->|pass| HOT[Hot-swap promoted adapter]
+    B -->|fail| REJ[Reject / keep current champion]
+    SK --> C
+    HOT --> M
+```
+
+The model may propose a learning action, but durable promotion is not supposed to depend on the model simply declaring itself better.
+
+## Qwen3.8-27B Mac profile
+
+On supported macOS configurations, Helix provides an automatic profile aimed at keeping a large local coding agent responsive under unified-memory constraints.
+
+The current automatic profile targets:
+
+- 64K context when the model and available memory permit it;
+- unified-memory-aware KV handling;
+- quantized KV defaults;
+- single-slot decode for the intended interactive-agent workload;
+- larger prefill batches where supported;
+- target-matched speculative decoding when a compatible drafter/backend is available.
+
+**Explicit user settings remain authoritative.** Automatic policy must not silently overwrite an explicit context length, cache type, slot count, placement choice, or speculative-decoding mode.
+
+A runtime fit reduction is a runtime outcome, not a new persistent user preference.
+
+See [`docs/UNSLOTH_27B_MAC_HARNESS.md`](docs/UNSLOTH_27B_MAC_HARNESS.md) for the current profile and learning details.
+
+## Speculative decoding
+
+Helix treats speculative decoding as an optional acceleration layer rather than a correctness shortcut.
+
+Supported/experimental lanes include:
+
+- ordinary target-only decoding;
+- native MTP where the model/backend supports it;
+- DFlash-family drafting where the target/drafter pair is compatible.
+
+Accepted speculative tokens are still verified by the target model. Real speedup depends on hardware, quantization, context length, acceptance rate, drafter cost, and backend implementation.
+
+A performance claim is considered meaningful only when the runtime can show that speculative decoding was actually active and accepted draft tokens were committed. Helix should never turn a paper's or checkpoint author's best-case multiplier into a universal local claim.
+
+## Persistent goals and plans
+
+Helix adds durable execution state around normal chat.
+
+- **Goal mode** represents the concrete outcome the agent is trying to achieve.
+- **Plan mode** stores the execution plan and progress toward that outcome.
+- State can survive ordinary chat turns instead of forcing the model to reconstruct the task from scratch every time.
+- Workspace surfaces expose outputs, background activity, sources, and subagent work.
+
+The intended loop is:
+
+```text
+goal -> inspect -> plan -> act -> observe -> verify -> update plan -> continue/stop
+```
+
+The agent should stop when the goal is complete, blocked, permission-gated, or requires a decision outside its configured authority.
+
+## Skills and procedural learning
+
+Helix can discover and use portable `SKILL.md` instructions compatible with local Codex/Claude-style workflows.
+
+Relevant commands include:
+
+- `/skills` — show available skills;
+- `/skill-name request` — load a selected skill for the current request;
+- `/plan [objective]` — switch to durable Plan mode;
+- `/goal [objective]` — switch to durable Goal mode;
+- `/github [query]` — use configured GitHub context;
+- `/speed` — report measured inference/runtime information;
+- `/learn` — open or invoke the learning workflow where available.
+
+Helix can also propose new skills while working. Generated skills are staged as plain text and are intended to remain inspectable and reversible. The public skill path does **not** silently install arbitrary generated executable code.
+
+Procedural knowledge belongs in skills; project facts belong in memory. Keeping those responsibilities separate helps prevent a large opaque prompt from becoming the real application state.
+
+## Local memory
+
+Mem0 support is optional. When available, Helix configures it for local, account-scoped use:
+
+- Qdrant data/history under the account learning directory;
+- a one-way account identifier rather than an email/account subject as the vector-store user id;
+- local embeddings;
+- the local Studio OpenAI-compatible endpoint as the default memory LLM path;
+- telemetry disabled by the adapter where supported.
+
+If Mem0 is unavailable, the bounded local JSON/task ledger remains usable.
+
+Optional dependency:
+
 ```bash
-curl -fsSL https://unsloth.ai/install.sh | sh
+pip install 'mem0ai>=0.1.118,<1.0'
 ```
-#### Windows:
-```powershell
-irm https://unsloth.ai/install.ps1 | iex
+
+The application should not silently downgrade the rest of the environment merely to satisfy an optional memory dependency.
+
+## Self-QLoRA and hot-swap
+
+QLoRA is the highest-risk learning tier and is therefore benchmark-gated.
+
+The current intended promotion flow is:
+
+```text
+observed recurring deficiency
+        |
+        v
+candidate training set
+        |
+        v
+QLoRA challenger
+        |
+        v
+held-out benchmark versus current baseline/champion
+        |
+   +----+----+
+   |         |
+ pass       fail
+   |         |
+ hot-swap   reject
+   |         |
+ rollback target remains available
 ```
-#### Community:
 
-- [Discord](https://discord.gg/unsloth)
-- [𝕏 (Twitter)](https://x.com/UnslothAI)
-- [Reddit](https://reddit.com/r/unsloth)
+The gate is external to the candidate model. Current policy requires deterministic held-out comparison, measurable quality improvement, and no throughput regression under the configured benchmark policy before automatic promotion.
 
-## ⭐ Features
-Unsloth works on **Windows, Linux, WSL** and **macOS**. We support **Multi GPU setups, NVIDIA, AMD, Intel GPUs, CPUs** and the **Vulkan** backend.
+A model critique or self-score alone is not evidence of improvement.
 
-### Run & Build with AI
-* Run and train LLMs, MLX, GGUF, diffusion, embedding, audio models: [Qwen3.8](https://unsloth.ai/docs/models/qwen3.8), [GLM-5.3-Flash](https://unsloth.ai/docs/models/glm-5.3-flash), [Kimi K3](https://unsloth.ai/docs/models/kimi-k3), MiniMax-H3, [DeepSeek-V4](https://unsloth.ai/docs/models/deepseek-v4), [Gemma 4](https://unsloth.ai/docs/models/gemma-4).
-* **Agents & Tools:** Use local models with [Claude Code](https://unsloth.ai/docs/basics/claude-code), [Codex](https://unsloth.ai/docs/basics/codex), and [MCP](https://unsloth.ai/docs/basics/mcp), including tool calling and code execution.
-* **Search & RAG:** Use private and unlimited web search, deep research, auto-compaction (rolling context window) and RAG.
-* **Image and video:** Run and train [image](https://unsloth.ai/docs/basics/diffusion-image) and video diffusion or multimodal models
-* **Remote & LAN:** Access your local models from any device on [LAN](https://unsloth.ai/docs/basics/lan) or remotely through secure [Cloudflare](https://unsloth.ai/docs/basics/how-to-serve-local-llms-anywhere-secure-remote-access-with-cloudflare-and-unsloth) HTTPS.
-* **Connect:** Serve models through an [OpenAI compatible API](https://unsloth.ai/docs/basics/api). Also connect your ChatGPT/Codex subscription and [cloud providers](https://unsloth.ai/docs/integrations/connections)
+Because adapters are separate from the base model, a promoted adapter can be hot-swapped and rolled back without destructively rewriting the base checkpoint.
 
+## GitHub-aware workflows
 
-### Train & Deploy
-* **Fine-tuning:** Train LLMs, diffusion, TTS, and embedding models 2× faster with 70% less VRAM with [no accuracy loss](https://unsloth.ai/blog#training)
-* **Complete support:** Supports [reinforcement learning](https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide), LoRA, QLoRA, full fine tuning, pretraining, RL, GRPO, DPO, and FP8.
-* **Export & Deploy:** [Export](https://unsloth.ai/docs/new/studio/export) or Deploy models with including [GGUF](https://unsloth.ai/docs/basics/inference-and-deployment/saving-to-gguf), NVFP4, FP8 and more formats.
-* **Datasets:** Build datasets from PDFs, CSVs, DOCX files, and more with [Data Recipes](https://unsloth.ai/docs/new/studio/data-recipe).
-  
-## 🚀 Unsloth Start
+The bundled local Codex plugin provides a read-only GitHub MCP configuration for repository, issue, pull-request, and source inspection.
 
-[Unsloth Start](https://unsloth.ai/docs/integrations/unsloth-start) connects [Claude Code](https://unsloth.ai/docs/basics/claude-code), [Codex](https://unsloth.ai/docs/basics/codex) and other agents to local models with one command.
+Helix can also use authenticated/local Git context through `/github` where configured. Credentials should remain in the connector/host; they should not be copied into prompts, logs, skills, or repository files.
+
+Repository evidence should retain useful provenance such as file paths and commits whenever the agent is making implementation or benchmark claims.
+
+## Computer use
+
+The current computer-use implementation is **macOS-only and experimental**.
+
+Available primitives include:
+
+- screenshot;
+- click;
+- typing;
+- key presses;
+- scrolling;
+- opening an application.
+
+Screenshot is read-only. Mutating UI actions are permission-gated by the local tool policy. macOS Accessibility permission is required for automation actions.
+
+Enable it in:
+
+`System Settings -> Privacy & Security -> Accessibility`
+
+Computer use is intentionally a bounded primitive, not a hidden shell escape.
+
+## Permissions
+
+The learning controls expose separate permission decisions for operations such as:
+
+- skill creation;
+- QLoRA training/promotion;
+- runtime repair;
+- Mem0 usage;
+- computer-use actions.
+
+The goal is to allow ordinary local chat to remain convenient while keeping higher-impact self-modification and UI actions explicit.
+
+## Installation
+
+### Important: upstream binaries are not Helix builds
+
+The release installers linked by the upstream Unsloth project install **upstream Unsloth**, not this experimental Helix branch.
+
+Until Helix publishes its own signed beta artifacts, use the source branch if you want the Helix features:
 
 ```bash
-unsloth start claude --model unsloth/Qwen3.8-27B-GGUF:UD-Q4_K_XL
-```
-
-| Agent | Command |
-| --- | --- |
-| Claude Code | `unsloth start claude` |
-| OpenAI Codex | `unsloth start codex` |
-| DeepSeek Harness | `unsloth start dsh` |
-| Hermes Agent | `unsloth start hermes` |
-| OpenCode | `unsloth start opencode` |
-| OpenClaw | `unsloth start openclaw` |
-
-## 📥 Install
-Unsloth can be used in three ways: **[Unsloth Desktop](https://unsloth.ai/download)**, the desktop app; **[Unsloth Studio](https://unsloth.ai/docs/new/studio/)**, the web UI; or **Unsloth Core**, the code based version.
-
-### Unsloth Desktop (recommended)
-
-<table>
-  <tr>
-    <td><b>Platform</b></td>
-    <td><b>Link</b></td>
-  </tr>
-  <tr>
-    <td><b>Windows</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Windows.exe'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>macOS</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-MacOS.dmg'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>Linux / Ubuntu (deb)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Ubuntu.deb'>Download</a></td>
-  </tr>
-  <tr>
-    <td><b>Linux (AppImage)</b></td>
-    <td><a href='https://github.com/unslothai/unsloth/releases/latest/download/Unsloth-Desktop-Linux.AppImage'>Download</a></td>
-  </tr>
-</table>
-
-### Unsloth Studio (web UI)
-
-#### macOS, Linux, WSL:
-```bash
-curl -fsSL https://unsloth.ai/install.sh | sh
-```
-
-#### Windows:
-```powershell
-irm https://unsloth.ai/install.ps1 | iex
-```
-
-#### Launch
-```bash
-unsloth studio
-```
-
-#### HTTP Secure Deployment
-```bash
-unsloth studio --secure
-```
-
-#### Docker
-Use our [Docker image](https://hub.docker.com/r/unsloth/unsloth) ```unsloth/unsloth```. On Linux, set up GPU access once with `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/docker/install_nvidia_toolkit.sh -o install_nvidia_toolkit.sh && sudo -E bash install_nvidia_toolkit.sh` (Windows: Docker Desktop with WSL 2). Run:
-```bash
-docker run -d --gpus all --ipc=host \
-  -p 8000:8000 -p 8888:8888 \
-  -e UNSLOTH_STUDIO_PASSWORD="mypassword" -e JUPYTER_PASSWORD="mypassword" \
-  -v "$PWD":/workspace/host \
-  -v unsloth-studio:/opt/unsloth-studio \
-  unsloth/unsloth
-```
-Follow startup with `docker logs -f`. Studio is at `http://localhost:8000` (user `unsloth`), JupyterLab at `http://localhost:8888`. The `unsloth-studio` volume keeps your accounts, chats and trained models across `docker rm`; each image brings its own Studio code, and a volume from an older image is migrated on the first start (its old code is kept under `.unsloth-studio-legacy/`). Tags (`unsloth/unsloth:core` for notebooks only), GPU support and options: [Docker Hub](https://hub.docker.com/r/unsloth/unsloth).
-
-#### Remote HTTPS & LAN Access
-Server-side tools are on by default - so **be careful**! Keep your password safe, or use `--disable-tools` when exposing Unsloth.
-
-**Global HTTPS Access**:
-Creates a free Cloudflare link that serves Unsloth - you can access the link globally (even on your phone!)
-```bash
-unsloth studio --secure
-```
-`-H 0.0.0.0` and different ports also work:
-```bash
-unsloth studio -H 0.0.0.0 -p 8888
-```
-**LAN Access (home network)**: `Settings > API keys > LAN access`
-
-#### Password management & headless starts
-Exposing Unsloth (`--secure`, `--cloudflare`, or a non-loopback `-H`) asks once at the terminal for a new admin password. Ctrl+C there aborts the launch rather than exposing the auto-generated one; set a password non-interactively instead, or use `-H 127.0.0.1` to stay off the network. On a non-loopback `-H` bind a terminal nobody answers is not a refusal: after ~30s Unsloth starts anyway and shuts down on the bootstrap deadline, so detached launches (`docker run -dt`, `tmux new -d`) are unaffected. Setting `UNSLOTH_STUDIO_BOOTSTRAP_TIMEOUT=0` disables that shutdown, so give those launches a password instead. A tunnel gets no such timeout and waits indefinitely rather than publish a public URL unasked, so give a detached `--secure` / `--cloudflare` launch its password non-interactively.
-
-Headless starts:
-```bash
-UNSLOTH_STUDIO_PASSWORD='your-strong-password' unsloth studio --secure   # via env var
-```
-Reset your password:
-```bash
-unsloth studio reset-password
-```
-
-#### Developer, Nightly, Uninstall
-To see developer, nightly and uninstallation etc. instructions, see [advanced installation](#-advanced-installation).
-
-### Unsloth Core (code-based)
-#### Linux, WSL:
-```bash
-curl -LsSf https://astral.sh/uv/install.sh | sh
-uv venv unsloth_env --python 3.13
-source unsloth_env/bin/activate
-uv pip install unsloth --torch-backend=auto
-```
-#### Windows:
-```powershell
-winget install -e --id Python.Python.3.13
-winget install --id=astral-sh.uv  -e
-uv venv unsloth_env --python 3.13
-.\unsloth_env\Scripts\activate
-uv pip install unsloth --torch-backend=auto
-```
-
-#### AMD, Intel, DGX Spark, Blackwell:
-See our [Blackwell guide](https://unsloth.ai/docs/blog/fine-tuning-llms-with-blackwell-rtx-50-series-and-unsloth) and [DGX Spark guide](https://unsloth.ai/docs/blog/fine-tuning-llms-with-nvidia-dgx-spark-and-unsloth). <br>
-To install Unsloth on **AMD** and **Intel** GPUs, follow our [AMD Guide](https://unsloth.ai/docs/basics/amd) and [Intel Guide](https://unsloth.ai/docs/get-started/install/intel).
-
-## 📒 Free Notebooks
-
-Train for free with our notebooks.
-Read our [guide](https://unsloth.ai/docs/get-started/fine-tuning-llms-guide). Add dataset, run, then deploy your trained model.
-
-| Model | Free Notebooks | Performance | Memory use |
-|-----------|---------|--------|----------|
-| **Unsloth Studio**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/unsloth/blob/main/studio/Unsloth_Studio_Colab.ipynb)               |  |  |
-| **Gemma 4 (E2B)**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Gemma4_(E2B)-Vision.ipynb)               | 1.5x faster | 50% less |
-| **Qwen3.5 (4B)**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen3_5_(4B)_Vision.ipynb)               | 1.5x faster | 60% less |
-| **gpt-oss (20B)**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/gpt-oss-(20B)-Fine-tuning.ipynb)               | 2x faster | 70% less |
-| **Qwen3.5 GSPO**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen3_5_(4B)_Vision_GRPO.ipynb)               | 2x faster | 70% less |
-| **gpt-oss (20B): GRPO**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/gpt-oss-(20B)-GRPO.ipynb)               | 2x faster | 80% less |
-| **Qwen3: Advanced GRPO**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Qwen3_(4B)-GRPO.ipynb)               | 2x faster | 70% less |
-| **embeddinggemma (300M)**    | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/EmbeddingGemma_(300M).ipynb)               | 2x faster | 20% less |
-| **Llama 3.1 (8B) Alpaca**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3.1_(8B)-Alpaca.ipynb)               | 2x faster | 70% less |
-| **Llama 3.2 Conversational**      | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Llama3.2_(1B_and_3B)-Conversational.ipynb)               | 2x faster | 70% less |
-| **Orpheus-TTS (3B)**     | [▶️ Start for free](https://colab.research.google.com/github/unslothai/notebooks/blob/main/nb/Orpheus_(3B)-TTS.ipynb)               | 1.5x faster | 50% less |
-
-- See all our notebooks for: [Kaggle](https://github.com/unslothai/notebooks?tab=readme-ov-file#-kaggle-notebooks), [GRPO](https://unsloth.ai/docs/get-started/unsloth-notebooks#grpo-reasoning-rl-notebooks), [TTS](https://unsloth.ai/docs/get-started/unsloth-notebooks#text-to-speech-tts-notebooks), [embedding](https://unsloth.ai/docs/new/embedding-finetuning) & [Vision](https://unsloth.ai/docs/get-started/unsloth-notebooks#vision-multimodal-notebooks)
-- See [all our models](https://unsloth.ai/docs/get-started/unsloth-model-catalog) and [all our notebooks](https://unsloth.ai/docs/get-started/unsloth-notebooks)
-- See detailed documentation for Unsloth [here](https://unsloth.ai/docs)
-
-## 🦥 Unsloth News
-- **AMD training**: Train, run RL, chat and deploy on AMD GPUs across Windows, WSL and Linux. [Guide](https://unsloth.ai/docs/basics/amd)
-- **Local models for any agent**: Use `unsloth start` with Claude Code, Codex, Hermes, OpenCode, OpenClaw, DeepSeek Harness and more through Unsloth's OpenAI- and Anthropic-compatible APIs. [Guide](https://unsloth.ai/docs/basics/api)
-- **GLM-5.2**: Run Z.ai's 744B-parameter, 1M-context open model locally with Unsloth Dynamic GGUFs. [Guide](https://unsloth.ai/docs/models/glm-5.2)
-- **DeepSeek-V4**: Run DeepSeek-V4-Flash locally with corrected multi-turn and tool-calling behavior. [Guide](https://unsloth.ai/docs/models/deepseek-v4)
-- **Gemma 4**: Run and train Gemma 4 text, image and audio models with QAT, MTP, GGUF and MLX support. [Guide](https://unsloth.ai/docs/models/gemma-4)
-- **MCP servers**: Connect local models to files, apps, databases and external tools through Model Context Protocol. [Guide](https://unsloth.ai/docs/basics/mcp)
-- **New models**: [Qwen-AgentWorld](https://huggingface.co/unsloth/Qwen-AgentWorld-35B-A3B-GGUF), [Ornith](https://huggingface.co/unsloth/models?search=ornith), [Kimi K2.7 Code](https://unsloth.ai/docs/models/kimi-k2.7-code) and [MiniMax M3](https://unsloth.ai/docs/models/minimax-m3)
-
-<details>
-  <summary>More News</summary>
-
-  - **Connections**: Mix local models with API providers (OpenAI, Anthropic) or servers (vLLM, Ollama) in the same interface. [Guide](https://unsloth.ai/docs/integrations/connections)
-  - **Introducing Unsloth Studio**: our new web UI for running and training LLMs. [Blog](https://unsloth.ai/docs/new/studio)
-  - **DiffusionGemma**: Run and fine-tune Google's diffusion language model with 1.8x faster inference in Unsloth Studio. [Guide](https://unsloth.ai/docs/models/diffusiongemma)
-  - **Qwen3.6**: Run and train Qwen3.6 with MTP for 1.4-2.2x faster inference and NVFP4 quants for supported GPUs. [Guide](https://unsloth.ai/docs/models/qwen3.6)
-  - Train **MoE LLMs 12x faster** with 35% less VRAM - DeepSeek, GLM, Qwen and gpt-oss. [Blog](https://unsloth.ai/docs/new/faster-moe)
-  - **Embedding models**: Unsloth now supports ~1.8-3.3x faster embedding fine-tuning. [Blog](https://unsloth.ai/docs/new/embedding-finetuning) • [Notebooks](https://unsloth.ai/docs/get-started/unsloth-notebooks#embedding-models)
-  - New **7x longer context RL** vs. all other setups, via our new batching algorithms. [Blog](https://unsloth.ai/docs/new/grpo-long-context)
-  - New RoPE & MLP **Triton Kernels** & **Padding Free + Packing**: 3x faster training & 30% less VRAM. [Blog](https://unsloth.ai/docs/new/3x-faster-training-packing)
-  - **500K Context**: Training a 20B model with >500K context is now possible on an 80GB GPU. [Blog](https://unsloth.ai/docs/blog/500k-context-length-fine-tuning)
-  - **FP8 & Vision RL**: You can now do FP8 & VLM GRPO on consumer GPUs. [FP8 Blog](https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/fp8-reinforcement-learning) • [Vision RL](https://unsloth.ai/docs/get-started/reinforcement-learning-rl-guide/vision-reinforcement-learning-vlm-rl)
-
-</details>
-
-## 📥 Advanced Installation
-The below advanced instructions are for Unsloth Studio. For Unsloth Core advanced installation, [view our docs](https://unsloth.ai/docs/get-started/install/pip-install#advanced-pip-installation).
-
-#### Developer / Nightly / Experimental installs: macOS, Linux, WSL:
-The developer install builds from the `main` branch, which is the latest (nightly) source.
-```bash
-git clone https://github.com/unslothai/unsloth
+git clone https://github.com/SuperHelix77/unsloth.git
 cd unsloth
-./install.sh --local
-unsloth studio -p 8888
-```
-To install into an isolated location, set `UNSLOTH_STUDIO_HOME`:
-```bash
-UNSLOTH_STUDIO_HOME="$PWD/.studio" ./install.sh --local
-UNSLOTH_STUDIO_HOME="$PWD/.studio" unsloth studio -p 8888
-```
-Then to update:
-```bash
-cd unsloth && git pull
-./install.sh --local
-unsloth studio -p 8888
+git checkout codex/unsloth-helix-27b-harness
 ```
 
-#### Developer / Nightly / Experimental installs: Windows PowerShell:
-The developer install builds from the `main` branch, which is the latest (nightly) source.
-```powershell
-git clone https://github.com/unslothai/unsloth.git
-cd unsloth
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\install.ps1 --local
-unsloth studio -p 8888
-```
-To install into an isolated location, set `UNSLOTH_STUDIO_HOME`:
-```powershell
-$env:UNSLOTH_STUDIO_HOME="$PWD\.studio"; .\install.ps1 --local
-$env:UNSLOTH_STUDIO_HOME="$PWD\.studio"; unsloth studio -p 8888
-```
-Then to update:
-```powershell
-cd unsloth; git pull
-.\install.ps1 --local
-unsloth studio -p 8888
-```
+Then use the repository's normal Unsloth Studio development/build workflow for your platform.
 
-#### Advanced launch options
+The project deliberately does not advertise an upstream release artifact as a Helix binary.
 
-Skip PyTorch (GGUF-only mode):
-```bash
-curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_NO_TORCH=1 sh
-```
-```powershell
-$env:UNSLOTH_NO_TORCH=1; irm https://unsloth.ai/install.ps1 | iex
-```
+## Development and validation
 
-Skip the post-install prompt that starts Unsloth (useful for automated installs):
-```bash
-curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_SKIP_AUTOSTART=1 sh
-```
-```powershell
-$env:UNSLOTH_SKIP_AUTOSTART=1; irm https://unsloth.ai/install.ps1 | iex
-```
+Helix changes should be evaluated against the unmodified/upstream behavior they replace.
 
-Keep the install-time package cache under the Studio directory instead of reusing an existing uv cache. Downloads are slower the first time, and an explicit `UV_CACHE_DIR` still wins over this:
-```bash
-curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_ISOLATE_UV_CACHE=1 sh
-```
-```powershell
-$env:UNSLOTH_ISOLATE_UV_CACHE=1; irm https://unsloth.ai/install.ps1 | iex
-```
-For a local run the flag is `--isolated-uv-cache`:
-```bash
-./install.sh --local --isolated-uv-cache
-```
-```powershell
-.\install.ps1 --local --isolated-uv-cache
-```
+Useful validation dimensions include:
 
-Pinning the Python version:
-```bash
-curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_PYTHON=3.12 sh
-```
-```powershell
-$env:UNSLOTH_PYTHON='3.12'; irm https://unsloth.ai/install.ps1 | iex
-```
+- time to first useful action;
+- warm-turn latency;
+- prefill/context-processing time;
+- committed decode throughput;
+- speculative acceptance rate;
+- peak memory / unified-memory pressure;
+- completed-task wall time;
+- task/test success;
+- tool-call count;
+- regression rate after a learned skill or QLoRA candidate;
+- rollback behavior.
 
-Install to a custom location with `UNSLOTH_STUDIO_HOME`:
-```bash
-curl -fsSL https://unsloth.ai/install.sh | UNSLOTH_STUDIO_HOME=/abs/path sh
-```
-```powershell
-$env:UNSLOTH_STUDIO_HOME='C:\path'; irm https://unsloth.ai/install.ps1 | iex
-```
+For source changes, use the relevant backend/frontend tests and build checks from the repository. The Helix branch includes focused tests for the Mac profile, speculative decoding, memory, learning, self-training, computer use, GitHub context, goals, and local skills.
 
-Point the frontend build at a corporate npm mirror/proxy with `UNSLOTH_NPM_REGISTRY`:
-```bash
-UNSLOTH_NPM_REGISTRY=https://artifactory.example.com/api/npm/npm/ ./install.sh --local
-```
-```powershell
-$env:UNSLOTH_NPM_REGISTRY='https://artifactory.example.com/api/npm/npm/'; .\install.ps1 --local
-```
+## Benchmarking philosophy
 
-Cap Unsloth's native CPU thread pools on high-core hosts: `UNSLOTH_CPU_THREADS=8 unsloth studio -p 8888`.
+Helix is designed around **measured improvement, not feature-count improvement**.
 
-#### Vulkan, custom llama.cpp backends:
+A candidate optimization should answer four questions:
 
-You can force the backend during installation: 
-```bash
-export UNSLOTH_LLAMA_CPP_BACKEND=vulkan   # or cpu, cuda, rocm, auto
-curl -fsSL https://unsloth.ai/install.sh | sh
-```
-```powershell
-$env:UNSLOTH_LLAMA_CPP_BACKEND="vulkan"   # or cpu, cuda, rocm, auto
-irm https://unsloth.ai/install.ps1 | iex
-```
+1. Did the task still succeed?
+2. Did it actually reduce latency, compute, memory, or repeated work?
+3. Did it introduce a regression elsewhere?
+4. Can it be disabled or rolled back cleanly?
 
-#### Uninstall
+Self-learning follows the same rule. A new skill or adapter should not become permanent merely because it was generated successfully.
 
-**MacOS, WSL, Linux:** `curl -fsSL https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.sh | sh`
+## Current limitations
 
-**Windows (PowerShell):** `irm https://raw.githubusercontent.com/unslothai/unsloth/main/scripts/uninstall.ps1 | iex`
+This is a beta. Known limitations include:
 
-For more info, [see our docs](https://unsloth.ai/docs/new/studio/install#uninstall).
+- the optimized development target is currently Qwen3.8-27B on Apple Silicon;
+- computer use is currently macOS-specific;
+- speculative-decoding support depends on the exact backend and target/drafter compatibility;
+- DFlash-family acceleration can fall back to ordinary decoding;
+- Mem0 is optional and may be unavailable in some installed environments;
+- QLoRA training/promotion remains experimental and should be treated as a reversible candidate process;
+- skill generation and procedural learning still require more long-horizon qualification;
+- platform coverage outside the primary Mac target is not yet equivalent;
+- benchmark results from one machine/model/context should not be generalized to every installation.
 
-#### Deleting model files
+## Safety and privacy
 
-You can delete old model files either from the bin icon in model search or by removing the relevant cached model folder from the default Hugging Face cache directory. By default, HF uses:
+Helix is local-first, but local execution is still execution.
 
-**MacOS, Linux, WSL:** `~/.cache/huggingface/hub/`
+- Review tool permissions before enabling autonomous operation.
+- Keep backups or Git history before allowing the agent to edit valuable work.
+- Treat computer-use actions as potentially destructive even when the model is local.
+- Do not put access tokens or secrets into skills, prompts, or logs.
+- Keep self-training datasets separate from held-out promotion benchmarks.
+- Preserve rollback paths for learned adapters and durable skills.
 
-**Windows:** `%USERPROFILE%\.cache\huggingface\hub\`
+## Relationship to upstream Unsloth
 
-## 💚 Community and Links
-| Type                                                                                                                                      | Links                                                                          |
-| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
-| <img width="16" src="https://cdn.prod.website-files.com/6257adef93867e50d84d30e2/66e3d80db9971f10a9757c99_Symbol.svg" />  **Discord**                       | [Join Discord server](https://discord.com/invite/unsloth)                          |
-| <img width="15" src="https://redditinc.com/hs-fs/hubfs/Reddit%20Inc/Brand/Reddit_Logo.png" />  **r/unsloth Reddit**                       | [Join Reddit community](https://reddit.com/r/unsloth)                          |
-| 📚 **Documentation & Wiki**                                                                                                               | [Read Our Docs](https://unsloth.ai/docs)                                       |
-| <img width="13" src="https://upload.wikimedia.org/wikipedia/commons/0/09/X_(formerly_Twitter)_logo_late_2025.svg" />  **Twitter (aka X)** | [Follow us on X](https://twitter.com/unslothai)                                |
-| 🔮 **Our Models**                                                                                                                         | [Unsloth Catalog](https://unsloth.ai/docs/get-started/unsloth-model-catalog)   |
-| ✍️ **Blog**                                                                                                                               | [Read our Blogs](https://unsloth.ai/blog)                                      |
+Unsloth Helix is an experimental community fork. It is **not an official Unsloth AI release** and should not be represented as one.
 
-### Citation
+The fork intentionally keeps upstream Unsloth's inference, training, Studio, installer, and model-support work wherever possible, while adding an experimental agent/learning layer.
 
-You can cite the Unsloth repo as follows:
-```bibtex
-@software{unsloth,
-  author = {Daniel Han, Michael Han and Unsloth team},
-  title = {Unsloth},
-  url = {https://github.com/unslothai/unsloth},
-  year = {2023}
-}
-```
-If you trained a model with 🦥Unsloth, you can use this cool sticker!   <img src="https://raw.githubusercontent.com/unslothai/unsloth/main/images/made with unsloth.png" width="200" align="center" />
+Upstream project: <https://github.com/unslothai/unsloth>
 
-### License
-Unsloth uses a dual-licensing model of Apache 2.0 and AGPL-3.0. The core Unsloth package remains licensed under **[Apache 2.0](https://github.com/unslothai/unsloth?tab=Apache-2.0-1-ov-file)**, while certain optional components, such as the Unsloth Studio UI are licensed under the open-source license **[AGPL-3.0](https://github.com/unslothai/unsloth?tab=AGPL-3.0-2-ov-file)**.
+Upstream documentation: <https://unsloth.ai/docs>
 
-This structure helps support ongoing Unsloth development while keeping the project open source and enabling the broader ecosystem to continue growing.
+## Licensing
 
-### Thank You to
-- The [llama.cpp library](https://github.com/ggml-org/llama.cpp) that lets users run and save models with Unsloth
-- The Hugging Face team and their libraries: [transformers](https://github.com/huggingface/transformers) and [TRL](https://github.com/huggingface/trl)
-- The Pytorch and [Torch AO](https://github.com/unslothai/unsloth/pull/3391) team for their contributions
-- NVIDIA for their [NeMo DataDesigner](https://github.com/NVIDIA-NeMo/DataDesigner) library and their contributions
-- And of course for every single person who has contributed or has used Unsloth!
+This repository inherits Unsloth's split licensing model. Check the license applicable to the files you modify or redistribute.
+
+In particular, the Studio surface is covered by the repository's AGPL license file, while other upstream portions use the licensing documented by Unsloth. Preserve upstream copyright, license, attribution, and modification notices when redistributing the fork.
+
+## Credits
+
+Unsloth Helix builds on the work of the upstream Unsloth project and the broader open-source ecosystem around local inference, PEFT/QLoRA, speculative decoding, Mem0, portable agent skills, and autonomous coding agents.
+
+The Helix-specific goal is to make those mechanisms compose into a measurable, reversible local agent rather than to hide their origins behind a new monolith.
+
+---
+
+**Status: beta. Expect rapid changes. Benchmark before trusting an optimization, and keep a rollback path.**

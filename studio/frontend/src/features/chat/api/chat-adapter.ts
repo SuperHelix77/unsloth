@@ -186,6 +186,58 @@ import {
   providerSupportsFastMode,
 } from "../provider-capabilities";
 import { selectCodeToolNames } from "./code-tool-placement";
+import { chatModeInstruction } from "../lib/chat-mode";
+import {
+  HERMES_LEARNING_CHANGED_EVENT,
+  isHermesLearningReviewRequest,
+  parseOnTheFlySkillDraft,
+  parseHermesLearningProposal,
+  stripOnTheFlySkillDraft,
+  stripHermesLearningProposal,
+} from "../lib/hermes-learning";
+import { createLearningProposal, getLearningContext } from "./learning-api";
+import {
+  recordSelfTrainingExample,
+  setSelfTrainingRecommendation,
+} from "./self-training-api";
+import { searchLearningMemory } from "./memory-api";
+
+type LearningContext = Awaited<ReturnType<typeof getLearningContext>>;
+let learningContextCache: {
+  value: LearningContext;
+  expiresAt: number;
+} | null = null;
+
+async function resolveLearningContext(): Promise<LearningContext> {
+  const now = Date.now();
+  if (learningContextCache && learningContextCache.expiresAt > now) {
+    return learningContextCache.value;
+  }
+  const value = await getLearningContext().catch(() => ({
+    enabled: false,
+    instruction: "",
+  }));
+  learningContextCache = {
+    value,
+    // Keep the common path off the network while allowing an approval in the Learning
+    // dialog to become active promptly on the next few turns.
+    expiresAt: now + (value.enabled ? 30_000 : 2_000),
+  };
+  return value;
+}
+
+if (typeof window !== "undefined") {
+  window.addEventListener(HERMES_LEARNING_CHANGED_EVENT, () => {
+    learningContextCache = null;
+  });
+}
+import {
+  createChatGoal,
+  goalInstruction,
+  goalObjectiveFromText,
+  sanitizeChatGoal,
+  type ChatGoalState,
+} from "../lib/chat-goal";
 import { ragScopeContextLength } from "./rag-context-length";
 import {
   type PendingImageEditReference,
@@ -280,6 +332,7 @@ import {
   lastReasoningGroupTextLength,
 } from "../utils/reasoning-duration";
 import { resolveLoadMaxSeqLength } from "../presets/preset-policy";
+import { preferQwen38MacNativeContext } from "@/lib/qwen38-v11";
 import type { CachedGgufRepo, CachedModelRepo } from "./chat-api";
 import {
   budgetImpliesTruncation,
@@ -704,6 +757,19 @@ function estimateTokenCount(text: string): number | undefined {
     return undefined;
   }
   return Math.max(1, Math.round(trimmed.length / 4));
+}
+
+function goalObjectiveFromMessages(messages: RunMessages): string {
+  const user = [...messages].reverse().find((message) => message.role === "user");
+  if (!user) return goalObjectiveFromText("");
+  if (typeof user.content === "string") return goalObjectiveFromText(user.content);
+  const text = Array.isArray(user.content)
+    ? user.content
+        .filter((part) => part.type === "text")
+        .map((part) => ("text" in part && typeof part.text === "string" ? part.text : ""))
+        .join(" ")
+    : "";
+  return goalObjectiveFromText(text);
 }
 
 function buildTiming(
@@ -1714,11 +1780,13 @@ export async function buildLocalTokenCountHistory(
         )
       : "";
   const projectInstructions = await resolveProjectInstructions(threadId);
+  const learningContext = await resolveLearningContext();
   const combinedSystemPrompt = [
     projectInstructions
       ? `<project_instructions>\n${projectInstructions}\n</project_instructions>`
       : "",
     safeSystemPrompt.trim(),
+    learningContext.enabled ? learningContext.instruction : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -1860,7 +1928,7 @@ export async function buildLocalTokenCountExtras(
     enabled_tools: [
       ...(ragOn ? ["search_knowledge_base"] : []),
       ...(toolsEnabled ? ["web_search"] : []),
-      ...(codeToolsEnabled ? ["python", "terminal", "edit_file"] : []),
+      ...(codeToolsEnabled ? ["python", "terminal", "edit_file", "computer"] : []),
       ...(artifactsEnabled ? ["render_html"] : []),
       // Same gate as the request: with no enabled skill neither tool is sent, so neither is priced.
       ...(hasEnabledSkills ? ["read_skill", "create_skill"] : []),
@@ -1965,11 +2033,13 @@ async function resolveChatInstructions(
     threadId,
     readThreadRecord,
   );
+  const learningContext = await resolveLearningContext();
   return [
     projectInstructions
       ? `<project_instructions>\n${projectInstructions}\n</project_instructions>`
       : "",
     safeSystemPrompt.trim(),
+    learningContext.enabled ? learningContext.instruction : "",
   ]
     .filter(Boolean)
     .join("\n\n");
@@ -3090,6 +3160,11 @@ async function autoLoadSmallestModel(options?: AutoLoadOptions): Promise<{
       pinnedMaxSeqLength: config.maxSeqLength,
       defaultMaxSeqLength: candidate.maxSeqLength,
       presetSource: currentStore.activePresetSource,
+      preferNativeContext: preferQwen38MacNativeContext({
+        modelId: candidate.id,
+        isGguf: candidate.kind === "gguf",
+        deviceType: platform.deviceType,
+      }),
     });
     // The GPU knobs are per-model: on a background auto-load the live store holds session
     // defaults, not the saved Manual mode / layer pin / GPU pick.
@@ -4379,7 +4454,9 @@ export function createOpenAIStreamAdapter(
       };
       const deepResearchHandoff = newDeepResearchHandoff();
       const continuation = readContinuationRequest(runConfig);
+      const planMode = runtime.chatMode === "plan";
       let deepResearchArmed =
+        !planMode &&
         runtime.deepResearchEnabled &&
         !options.pairId &&
         (options.modelType === undefined || options.modelType === "base");
@@ -4539,6 +4616,7 @@ export function createOpenAIStreamAdapter(
         imageToolsEnabled,
         artifactsEnabled,
         mcpEnabledForChat,
+        chatMode,
         confirmToolCalls,
         bypassPermissions,
         permissionMode,
@@ -4550,6 +4628,38 @@ export function createOpenAIStreamAdapter(
         ragAutoInject,
         ragAutoInjectMinScore,
       } = runtime;
+      let conversationGoal: ChatGoalState | null = sanitizeChatGoal(
+        (await readThreadRecord?.())?.settings?.goal,
+      ) ?? null;
+      if (chatMode === "goal") {
+        if (conversationGoal?.status === "paused") {
+          throw new Error("This goal is paused. Resume it before sending.");
+        }
+        if (!conversationGoal || conversationGoal.status === "completed") {
+          conversationGoal = createChatGoal(goalObjectiveFromMessages(messages));
+          if (resolvedThreadId) {
+            await updateStoredChatThread(resolvedThreadId, {
+              settingsPatch: { goal: conversationGoal },
+            });
+          }
+        } else if (conversationGoal.status === "draft") {
+          conversationGoal = {
+            ...conversationGoal,
+            status: "active",
+            updatedAt: Date.now(),
+            completedAt: undefined,
+          };
+          if (resolvedThreadId) {
+            await updateStoredChatThread(resolvedThreadId, {
+              settingsPatch: { goal: conversationGoal },
+            });
+          }
+        }
+      }
+      const goalSystemInstruction =
+        chatMode === "goal" && conversationGoal?.status === "active"
+          ? goalInstruction(conversationGoal)
+          : null;
       if (
         deepResearchArmed &&
         !supportsTools &&
@@ -4646,6 +4756,7 @@ export function createOpenAIStreamAdapter(
       const imageGenerationEnabledForThisTurn = Boolean(
         externalProvider &&
           externalSelection &&
+          !planMode &&
           imageToolsEnabled &&
           providerSupportsBuiltinImageGeneration(
             externalProvider.providerType,
@@ -4660,6 +4771,7 @@ export function createOpenAIStreamAdapter(
       const webSearchEnabledForThisTurn = Boolean(
         externalProvider &&
           externalSelection &&
+          !planMode &&
           toolsEnabled &&
           providerSupportsBuiltinWebSearch(
             externalProvider.providerType,
@@ -4670,6 +4782,7 @@ export function createOpenAIStreamAdapter(
       const codeExecEnabledForThisTurn = Boolean(
         externalProvider &&
           externalSelection &&
+          !planMode &&
           codeToolsEnabled &&
           !geminiImageModeForThisTurn &&
           providerSupportsBuiltinCodeExecution(
@@ -4682,6 +4795,7 @@ export function createOpenAIStreamAdapter(
       // chat-page setState where unsupported.
       const webFetchEnabledForThisTurn = Boolean(
         externalProvider &&
+          !planMode &&
           webFetchToolsEnabled &&
           providerSupportsBuiltinWebFetch(externalProvider.providerType),
       );
@@ -4883,6 +4997,7 @@ export function createOpenAIStreamAdapter(
       // Canvas is independent of Search/Code: render_html stays local-only and mirrors the backend image-turn gate.
       const renderHtmlToolEnabledForThisTurn = Boolean(
         !isExternalRequest &&
+          !planMode &&
           supportsTools &&
           artifactsEnabled &&
           !hasOutboundImage,
@@ -4898,6 +5013,8 @@ export function createOpenAIStreamAdapter(
           : disabledToolGuard;
       addSystemInstruction(outboundMessages, effectiveDisabledToolGuard);
       addSystemInstruction(outboundMessages, artifactInstruction);
+      addSystemInstruction(outboundMessages, chatModeInstruction(chatMode));
+      addSystemInstruction(outboundMessages, goalSystemInstruction);
 
       // Block when ANY image is in the outbound payload and the loaded model cannot process images;
       // switching models means starting a new chat.
@@ -5721,18 +5838,21 @@ export function createOpenAIStreamAdapter(
           ),
           tools: {
             search:
-              webSearchEnabledForThisTurn ||
-              (!isExternalRequest && supportsTools && toolsEnabled),
-            fetch: webFetchEnabledForThisTurn,
+              !planMode &&
+              (webSearchEnabledForThisTurn ||
+                (!isExternalRequest && supportsTools && toolsEnabled)),
+            fetch: !planMode && webFetchEnabledForThisTurn,
             code:
-              codeExecEnabledForThisTurn ||
-              (!isExternalRequest && supportsTools && codeToolsEnabled),
-            images: imageGenerationEnabledForThisTurn,
-            mcp: supportsStudioToolsForThisTurn && mcpEnabledForChat,
+              !planMode &&
+              (codeExecEnabledForThisTurn ||
+                (!isExternalRequest && supportsTools && codeToolsEnabled)),
+            images: !planMode && imageGenerationEnabledForThisTurn,
+            mcp: !planMode && supportsStudioToolsForThisTurn && mcpEnabledForChat,
             docs:
+              !planMode &&
               supportsStudioToolsForThisTurn &&
               (ragEnabled || projectRagEnabled),
-            artifacts: renderHtmlToolEnabledForThisTurn,
+            artifacts: !planMode && renderHtmlToolEnabledForThisTurn,
             confirmToolCalls,
             bypassPermissions,
             permissionMode,
@@ -5942,6 +6062,7 @@ export function createOpenAIStreamAdapter(
               // studioLocalCodeTools, not codeToolsEnabled: a Code pill that resolved to the provider's
               // sandbox is a hosted request and belongs below, where this body would 400 on permission_mode.
               ...(supportsStudioToolsForThisTurn &&
+              !planMode &&
               (toolsEnabled ||
                 studioLocalCodeTools.length > 0 ||
                 mcpEnabledForChat ||
@@ -6029,10 +6150,11 @@ export function createOpenAIStreamAdapter(
                         }
                       : {}),
                   }
-                : webSearchEnabledForThisTurn ||
+                : !planMode &&
+                  (webSearchEnabledForThisTurn ||
                     webFetchEnabledForThisTurn ||
                     codeExecEnabledForThisTurn ||
-                    imageGenerationEnabledForThisTurn
+                    imageGenerationEnabledForThisTurn)
                   ? {
                       enable_tools: true,
                       enabled_tools: [
@@ -6186,6 +6308,7 @@ export function createOpenAIStreamAdapter(
             bypass_permissions: bypassPermissions,
             ...(deepResearchArmed ? { deep_research_armed: true } : {}),
             ...(supportsTools &&
+              !planMode &&
               (toolsEnabled ||
                 codeToolsEnabled ||
                 renderHtmlToolEnabledForThisTurn ||
@@ -6206,7 +6329,7 @@ export function createOpenAIStreamAdapter(
                       ? ["read_skill", "create_skill"]
                       : []),
                     ...(codeToolsEnabled
-                      ? ["python", "terminal", "edit_file"]
+                      ? ["python", "terminal", "edit_file", "computer"]
                       : []),
                     ...(renderHtmlToolEnabledForThisTurn
                       ? ["render_html"]
@@ -7796,9 +7919,122 @@ export function createOpenAIStreamAdapter(
           incompleteReason,
           contextWindowExceeded,
         );
+        // A completed Plan turn becomes a durable draft that the progress row can hand off to
+        // Goal mode. Never overwrite an active/paused goal with a planning detour, and do not
+        // persist a partial/error answer as if it were an approved plan.
+        if (
+          planMode &&
+          resolvedThreadId &&
+          finalIncompleteReason === null &&
+          (!conversationGoal || conversationGoal.status === "draft")
+        ) {
+          const planText = answerTextFromParts(
+            buildAssistantContent(mergeContinuation(cumulativeText, { final: true })),
+          ).trim();
+          if (planText) {
+            const planGoal = createChatGoal(goalObjectiveFromMessages(messages), {
+              status: "draft",
+              plan: planText,
+            });
+            await updateStoredChatThread(resolvedThreadId, {
+              settingsPatch: { goal: planGoal },
+            });
+            conversationGoal = planGoal;
+          }
+        }
+        const finalAssistantRawText = mergeContinuation(cumulativeText, {
+          final: true,
+        });
+        const finalAssistantText = answerTextFromParts(
+          buildAssistantContent(finalAssistantRawText),
+        );
+        const latestUserText = generationUserMessage
+          ? collectTextParts(generationUserMessage).join("\n")
+          : "";
+        const learningProposal =
+          finalIncompleteReason === null &&
+          isHermesLearningReviewRequest(latestUserText)
+            ? parseHermesLearningProposal(finalAssistantText)
+            : null;
+        const onTheFlySkillDraft =
+          finalIncompleteReason === null &&
+          !isExternalRequest &&
+          !isHermesLearningReviewRequest(latestUserText)
+            ? parseOnTheFlySkillDraft(finalAssistantText)
+            : null;
+        const stagedLearningProposal = learningProposal;
+        if (stagedLearningProposal) {
+          void Promise.all([
+            createLearningProposal({
+              ...stagedLearningProposal,
+              ...(resolvedThreadId ? { sourceThreadId: resolvedThreadId } : {}),
+            }),
+            ...(stagedLearningProposal.recommendationAction
+              ? [
+                  setSelfTrainingRecommendation({
+                    action: stagedLearningProposal.recommendationAction,
+                    reason: stagedLearningProposal.recommendationReason,
+                  }),
+                ]
+              : []),
+          ])
+            .then(() => {
+              if (typeof window !== "undefined") {
+                window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT));
+              }
+            })
+            .catch(() => undefined);
+        }
+        // An on-the-fly skill is a draft, not a fact. It enters the review inbox
+        // only when Mem0 finds at least one earlier similar experience: one task
+        // is an observation, two are a repeatable pattern. This keeps procedural
+        // learning ahead of costly weight updates without teaching from a single
+        // anomalous turn.
+        if (onTheFlySkillDraft) {
+          void searchLearningMemory(
+            `${onTheFlySkillDraft.title}\n${onTheFlySkillDraft.content}`,
+            3,
+          )
+            .then((memory) => {
+              if (!memory.available || memory.results.length < 1) return;
+              return createLearningProposal({
+                ...onTheFlySkillDraft,
+                reason: `${onTheFlySkillDraft.reason ?? "Repeatable procedure"} Mem0 found a prior similar experience.`,
+                ...(resolvedThreadId ? { sourceThreadId: resolvedThreadId } : {}),
+              });
+            })
+            .then((result) => {
+              if (result && typeof window !== "undefined") {
+                window.dispatchEvent(new Event(HERMES_LEARNING_CHANGED_EVENT));
+              }
+            })
+            .catch(() => undefined);
+        }
+        const displayAssistantRawText = stagedLearningProposal || onTheFlySkillDraft
+          ? stripOnTheFlySkillDraft(stripHermesLearningProposal(finalAssistantRawText))
+          : finalAssistantRawText;
+        // Post-task collection is deliberately fire-and-forget: it never delays or
+        // changes the answer. It records only completed local text turns; review
+        // prompts are excluded so the learner sees task data, not its own protocol.
+        if (
+          finalIncompleteReason === null &&
+          !isExternalRequest &&
+          !isHermesLearningReviewRequest(latestUserText) &&
+          latestUserText.trim() &&
+          displayAssistantRawText.trim()
+        ) {
+          void recordSelfTrainingExample({
+            modelId: params.checkpoint,
+            prompt: latestUserText,
+            completion: answerTextFromParts(
+              buildAssistantContent(displayAssistantRawText),
+            ),
+            ...(resolvedThreadId ? { sourceThreadId: resolvedThreadId } : {}),
+          }).catch(() => undefined);
+        }
         yield {
           content: [
-            ...buildAssistantContent(mergeContinuation(cumulativeText, { final: true })),
+            ...buildAssistantContent(displayAssistantRawText),
             ...sourceParts,
             ...documentCitationParts,
           ],

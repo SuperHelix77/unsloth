@@ -108,6 +108,20 @@ import { listPromptEntries, type PromptEntry } from "./api/prompts-api";
 import { McpComposerButton } from "./mcp-composer-button";
 import { BypassPermissionsMenuItem } from "./bypass-permissions-menu-item";
 import { PermissionModeComposerPill } from "./permission-mode-select";
+import { ChatModePill } from "./chat-mode-pill";
+import { LocalSkillsPill } from "./local-skills-pill";
+import { LocalSkillsCommandMenu } from "./local-skills-command-menu";
+import {
+  LOCAL_SKILLS_CHANGED_EVENT,
+  type InstalledLocalSkill,
+  localSkillPrompt,
+  localSkillsHelp,
+  localSkillsForQuery,
+  localSlashQuery,
+  openLocalSkillsManager,
+  parseLocalSlashCommand,
+} from "./lib/local-skills";
+import { listLocalSkills, readLocalSkill } from "./api/local-skills-api";
 import { reasoningCapsFromLoad } from "./lib/apply-inference-status-to-store";
 import { KnowledgeBaseComposerButton } from "@/features/rag/components/knowledge-base-composer-button";
 import { NewProjectDialog } from "./components/new-project-dialog";
@@ -565,6 +579,17 @@ export function SharedComposer({
     navigate({ to: "/chat" });
   }, [navigate, onExitCompare]);
   const [text, setText] = useState("");
+  const [installedLocalSkills, setInstalledLocalSkills] = useState<InstalledLocalSkill[]>([]);
+  const refreshInstalledLocalSkills = useCallback(() => {
+    void listLocalSkills()
+      .then(setInstalledLocalSkills)
+      .catch(() => undefined);
+  }, []);
+  useEffect(() => {
+    refreshInstalledLocalSkills();
+    window.addEventListener(LOCAL_SKILLS_CHANGED_EVENT, refreshInstalledLocalSkills);
+    return () => window.removeEventListener(LOCAL_SKILLS_CHANGED_EVENT, refreshInstalledLocalSkills);
+  }, [refreshInstalledLocalSkills]);
   const [running, setRunning] = useState(false);
   const [comparing, setComparing] = useState(false);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
@@ -845,6 +870,7 @@ export function SharedComposer({
   const isMobile = useIsMobile();
   const pillCount =
     4 +
+    1 +
     (showImagePill ? 1 : 0) +
     (showRagPill && ragEnabled ? 1 : 0) +
     (showWebFetchPill ? 1 : 0) +
@@ -1075,7 +1101,55 @@ export function SharedComposer({
     const submittedText = text;
     const submittedImages = pendingImages;
     const submittedAudio = pendingAudio;
-    const msg = submittedText.trim();
+    const localCommand = parseLocalSlashCommand(
+      submittedText,
+      installedLocalSkills,
+    );
+    if (localCommand?.mode) {
+      useChatRuntimeStore.getState().setChatMode(localCommand.mode);
+    }
+    if (
+      localCommand?.command === "/github" ||
+      localCommand?.command === "/speed"
+    ) {
+      // GitHub context and runtime performance are read-only built-ins. Arming the
+      // existing tools switch here makes slash commands work even when the user
+      // has not first clicked Search.
+      setToolsEnabled(true);
+    }
+    if (
+      localCommand?.handled &&
+      submittedImages.length === 0 &&
+      !submittedAudio
+    ) {
+      setText("");
+      toast.message(
+        localCommand.help ? "Local skills" : `${localCommand.command} ready`,
+        {
+          description: localCommand.help
+            ? localSkillsHelp()
+            : "Add an objective after the command, then press Enter.",
+        },
+      );
+      resetPromptQueue();
+      return;
+    }
+    let msg = localCommand?.message ?? submittedText.trim();
+    if (localCommand?.skillName) {
+      try {
+        const skill = await readLocalSkill(localCommand.skillName);
+        msg = localSkillPrompt(skill.name, skill.instructions, localCommand.args);
+      } catch (error) {
+        toast.error("Could not invoke local skill", {
+          description:
+            error instanceof Error
+              ? error.message
+              : "The SKILL.md file could not be read.",
+        });
+        resetPromptQueue();
+        return;
+      }
+    }
     if (!msg && submittedImages.length === 0 && !submittedAudio) {
       resetPromptQueue();
       return;
@@ -1870,6 +1944,27 @@ export function SharedComposer({
   }
   sendRef.current = send;
 
+  const chooseLocalSkill = useCallback(
+    (command: string) => {
+      if (command === "/skills") {
+        setText("");
+        openLocalSkillsManager();
+        return;
+      }
+      if (command === "/github" || command === "/speed") {
+        setToolsEnabled(true);
+      }
+      if (command === "/plan" || command === "/goal") {
+        useChatRuntimeStore
+          .getState()
+          .setChatMode(command.slice(1) as "plan" | "goal");
+      }
+      setText(`${command} `);
+      requestAnimationFrame(() => textareaRef.current?.focus());
+    },
+    [setToolsEnabled],
+  );
+
   function stop() {
     if (isDictating) stopDictation();
     for (const handle of Object.values(handlesRef.current)) {
@@ -1878,6 +1973,14 @@ export function SharedComposer({
   }
 
   const busy = running || comparing;
+  const localSkillQuery = localSlashQuery(text);
+  const localSkillItems =
+    localSkillQuery === null
+      ? []
+      : localSkillsForQuery(localSkillQuery, installedLocalSkills);
+  const localSkillMenuOpen =
+    localSkillQuery !== null && !isDictating && !busy;
+  const [localSkillMenuIndex, setLocalSkillMenuIndex] = useState(0);
 
   function onKeyDown(e: KeyboardEvent) {
     // IME composition (JP/CN/KR): Enter commits the candidate, so do not hijack it (#5318). Re-pin
@@ -1900,6 +2003,37 @@ export function SharedComposer({
         return;
       }
       setCompositionState(false);
+    }
+    if (localSkillMenuOpen) {
+      if (e.key === "ArrowDown" && localSkillItems.length > 0) {
+        e.preventDefault();
+        setLocalSkillMenuIndex((index) => (index + 1) % localSkillItems.length);
+        return;
+      }
+      if (e.key === "ArrowUp" && localSkillItems.length > 0) {
+        e.preventDefault();
+        setLocalSkillMenuIndex((index) =>
+          index <= 0 ? localSkillItems.length - 1 : index - 1,
+        );
+        return;
+      }
+      if (
+        (e.key === "Enter" || e.key === "Tab") &&
+        !e.shiftKey &&
+        localSkillItems.length > 0
+      ) {
+        e.preventDefault();
+        chooseLocalSkill(
+          localSkillItems[Math.min(localSkillMenuIndex, localSkillItems.length - 1)]
+            .command,
+        );
+        return;
+      }
+      if (e.key === "Escape") {
+        e.preventDefault();
+        setText("");
+        return;
+      }
     }
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
@@ -2229,7 +2363,14 @@ export function SharedComposer({
         </div>
       )}
       {skillMentions.popover}
-
+      {localSkillMenuOpen ? (
+        <LocalSkillsCommandMenu
+          query={localSkillQuery ?? ""}
+          activeIndex={localSkillMenuIndex}
+          onSelect={chooseLocalSkill}
+          installedSkills={installedLocalSkills}
+        />
+      ) : null}
       <textarea
         {...skillMentions.inputProps}
         ref={textareaRef}
@@ -2459,6 +2600,8 @@ export function SharedComposer({
           {/* Permission-level pill sits immediately after Compare and ahead of every other tool pill so the
               Full access danger state reads first. */}
           <PermissionModeComposerPill side="top" />
+          <ChatModePill side="top" />
+          <LocalSkillsPill side="top" onSelectCommand={chooseLocalSkill} />
           <button
             type="button"
             disabled={searchDisabled}

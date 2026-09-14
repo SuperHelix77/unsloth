@@ -52,6 +52,11 @@ import {
 } from "@/hooks/gpu-vram";
 import { ChevronDownStandardIcon } from "@/lib/chevron-icons";
 import { toast } from "@/lib/toast";
+import { EXPERIMENTAL_SPECULATIVE_TYPES } from "@/lib/speculative-modes";
+import {
+  preferQwen38MacNativeContext,
+  Q38_V11_PREFERRED_CONTEXT_LENGTH,
+} from "@/lib/qwen38-v11";
 import {
   type ReactNode,
   type Ref,
@@ -200,6 +205,7 @@ const SPECULATIVE_TYPE_LABELS: Record<
   mtp: "MTP",
   dspark: "DSpark",
   dflash: "DFlash",
+  dflare: "DFlare",
   ngram: "Ngram",
   "mtp+ngram": "MTP+Ngram",
   off: "Off",
@@ -1176,16 +1182,20 @@ function GgufAdvancedSettings({
 
       <div className={ROW_CLASS}>
         <div className="flex min-w-0 items-center gap-1.5">
-          <span className={LABEL_CLASS_WRAP}>Speculative Decoding</span>
-          <InfoHint>
-            Faster generation. Auto picks the best strategy for the model and
-            platform: DSpark or DFlash when the model ships a drafter sidecar,
-            otherwise MTP / ngram. Pick a strategy to force it, or Off to
-            disable. DSpark downloads a sidecar of about 11 GB and DFlash one of
-            about 1.5 GB, both trading VRAM for speed; on quantized targets
-            their greedy output can differ from a non speculative run. MTP and
-            ngram do not change output.
-          </InfoHint>
+            <span className={LABEL_CLASS_WRAP}>Speculative Decoding</span>
+            <InfoHint>
+              Faster generation. Auto picks the best strategy for the model and
+              platform: DSpark or DFlash when the model ships a drafter sidecar;
+              native MLX safetensors models can also use DFlash or DFlare.
+              Otherwise it uses MTP / ngram. Pick a strategy to force it, or Off to
+              disable. DSpark downloads a sidecar of about 11 GB and DFlash one of
+              about 1.5 GB, both trading VRAM for speed; on quantized targets
+              their greedy output can differ from a non speculative run. MTP and
+              ngram do not change output. MTP, DFlash, and DFlare are experimental
+              on the Qwen3.8 v1.1 Mac profile: they are opt-in, capability-checked,
+              and fall back to ordinary decoding if startup or memory pressure
+              makes the drafter unusable. The app does not promise a universal 5x gain.
+            </InfoHint>
         </div>
         <Select
           value={config.speculativeType ?? speculativeFallback}
@@ -1213,8 +1223,17 @@ function GgufAdvancedSettings({
           </SelectTrigger>
           <SelectContent className="menu-soft-surface ring-0 border-0 rounded-lg">
             {SPECULATIVE_TYPES.map((type) => (
-              <SelectItem key={type} value={type}>
-                {SPECULATIVE_TYPE_LABELS[type]}
+              <SelectItem
+                key={type}
+                value={type}
+                textValue={SPECULATIVE_TYPE_LABELS[type]}
+              >
+                <span className="flex items-center gap-2">
+                  <span>{SPECULATIVE_TYPE_LABELS[type]}</span>
+                  {EXPERIMENTAL_SPECULATIVE_TYPES.has(type) && (
+                    <span className="text-[10px] text-muted-foreground">experimental</span>
+                  )}
+                </span>
               </SelectItem>
             ))}
           </SelectContent>
@@ -1227,7 +1246,7 @@ function GgufAdvancedSettings({
             <span className={LABEL_CLASS}>Draft Tokens</span>
             <InfoHint>
               Max draft tokens per step. Leave blank for the default (MTP and
-              DFlash: 2 on GPU, 3 on CPU/Mac; DSpark: 3).
+              DFlash: 2 with a GPU, 3 CPU-only; DSpark: 3).
             </InfoHint>
           </div>
           <input
@@ -2435,6 +2454,11 @@ export function ModelConfigPage({
     target.meta.contextLength ?? stagedDims?.contextLength ?? null;
   const activeLoadedContext =
     isActiveModel && target.isGguf ? loadedContextLength : null;
+  const preferQwen38MacContext = preferQwen38MacNativeContext({
+    modelId: target.id,
+    isGguf: target.isGguf,
+    deviceType: platformDeviceType,
+  });
   // resolveLoadMaxSeqLength returns 0 for a builtin-default GGUF load before it looks at the
   // resident context, so the estimate must not fall back to it either.
   const activePresetSource = useChatRuntimeStore((s) => s.activePresetSource);
@@ -2445,7 +2469,8 @@ export function ModelConfigPage({
       nativeContextLength ?? 0,
       activeLoadedContext ?? 0,
       config.customContextLength ?? 0,
-    ) || 32768,
+    ) ||
+      (preferQwen38MacContext ? Q38_V11_PREFERRED_CONTEXT_LENGTH : 32768),
   );
   const contextValue = Math.min(
     Math.max(
@@ -2461,7 +2486,10 @@ export function ModelConfigPage({
   const contextInputValue = contextIsAuto
     ? Math.min(
         Math.max(
-          activeLoadedContext ?? AUTO_OFFLOAD_CONTEXT_LENGTH,
+          activeLoadedContext ??
+            (preferQwen38MacContext
+              ? Q38_V11_PREFERRED_CONTEXT_LENGTH
+              : AUTO_OFFLOAD_CONTEXT_LENGTH),
           minContext,
         ),
         maxContext,

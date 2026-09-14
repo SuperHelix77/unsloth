@@ -4752,6 +4752,22 @@ def _extra_args_requests_dflash(
     return "draft-dflash" in _accumulated_spec_types(extra_args, env)
 
 
+def _extra_args_request_drafter(
+    extra_args: Optional[Iterable[str]], env: Optional[Mapping[str, str]] = None
+) -> bool:
+    """True when a separate or embedded multi-token drafter is requested.
+
+    Keep this predicate beside the individual MTP/DSpark/DFlash readers. It is
+    intentionally narrower than "any speculative mode": ngram speculation has
+    no drafter process to recover when the server exits.
+    """
+    return (
+        _extra_args_requests_mtp(extra_args, env)
+        or _extra_args_requests_dspark(extra_args, env)
+        or _extra_args_requests_dflash(extra_args, env)
+    )
+
+
 @functools.lru_cache(maxsize = 1)
 def _metal_device_is_paravirtual() -> bool:
     """True when Metal is a virtualised Apple GPU, whose offload can corrupt output.
@@ -27521,10 +27537,14 @@ class LlamaCppBackend:
                 _spec_requested_dflash = any(
                     "draft-dflash" in str(t).lower() for t in spec_flags
                 ) or _extra_args_requests_dflash(extra_args, env = _launch_spec_env)
-                # Is the launched server actually running MTP+tensor? Gates the
-                # probe/watchdog/recovery; cleared if the MTP-drop fallback wins.
+                # Is the launched server actually running a drafter that needs
+                # fail-open recovery? MTP+tensor keeps its first-decode probe;
+                # DFlash/DSpark also arm the watchdog because a sidecar can die
+                # after /health even when tensor parallelism is not in use.
                 _mtp_active_for_launched_server = bool(
-                    self._tensor_parallel and _spec_requested_mtp
+                    (self._tensor_parallel and _spec_requested_mtp)
+                    or _spec_requested_dspark
+                    or _spec_requested_dflash
                 )
                 # MTP can pass /health then crash the flash-attn kernel on the
                 # first decode under tensor; probe one generation so the fallback
@@ -30651,14 +30671,17 @@ class LlamaCppBackend:
                 logger.debug(f"slot {entry.get('id')} restore returned HTTP {resp.status_code}")
 
     def _maybe_recover_from_mtp_crash(self, exc: Optional[BaseException] = None) -> bool:
-        """Schedule one background reload without MTP after a mid-generation death.
+        """Schedule one background reload without a multi-token drafter.
 
-        MTP+tensor can crash the flash-attn kernel on a later request, after
-        load_model returned, past the load-time fallback and decode probe. Not a
-        persistent ban: a fresh load re-tries MTP. Returns True if scheduled.
+        A MTP, DSpark, or DFlash process can pass /health and still die during
+        generation. This is a fail-open recovery: the next load retries the
+        requested experimental path, while the immediate replacement uses the
+        authoritative target alone so a drafter failure costs wall time rather
+        than taking the target offline. The historical method name remains for
+        callers and compatibility with existing integrations.
         """
-        # Cheap async-safe gate: only our live MTP+tensor launch, not cancelled,
-        # with a snapshot to replay.
+        # Cheap async-safe gate: only a live drafter launch, not cancelled, with
+        # a snapshot to replay.
         if self._cancel_event.is_set():
             return False
         if not self._mtp_runtime_fallback_active:
@@ -30683,11 +30706,15 @@ class LlamaCppBackend:
                 while proc.poll() is None and time.monotonic() < deadline:
                     time.sleep(0.1)
                 if proc.poll() is None:
-                    logger.debug("Generation error but llama-server is alive; keeping MTP.")
+                    logger.debug(
+                        "Generation error but llama-server is alive; keeping speculative decoding."
+                    )
                     return
+                drafter_kind = self._spec_drafter_kind or "multi-token drafter"
                 logger.warning(
-                    "llama-server exited mid-generation with MTP under tensor "
-                    "parallelism (%s); reloading without speculative decoding.",
+                    "llama-server exited mid-generation with %s (%s); reloading "
+                    "without speculative decoding.",
+                    drafter_kind,
                     type(exc).__name__ if exc is not None else "server exited",
                 )
                 # Re-check under the load lock (RLock allows the nested
@@ -30699,7 +30726,9 @@ class LlamaCppBackend:
                             logger.info("MTP-crash reload skipped: load was cancelled/unloaded.")
                             return
                         if self._process is not proc:
-                            logger.info("MTP-crash reload skipped: a newer load is already active.")
+                            logger.info(
+                                "Speculative-crash reload skipped: a newer load is already active."
+                            )
                             return
                         if self._last_load_intent != snapshot:
                             logger.info("MTP-crash reload skipped: load settings changed.")
@@ -30711,7 +30740,7 @@ class LlamaCppBackend:
                     # inherited env for the replay too.
                     _ea = list(snapshot.extra_args or ())
                     fallback_extra_args = snapshot.extra_args
-                    if _extra_args_requests_mtp(_ea, env = _child_spec_env(_ea)):
+                    if _extra_args_request_drafter(_ea, env = _child_spec_env(_ea)):
                         fallback_extra_args = tuple(
                             strip_shadowing_flags(
                                 _ea,
@@ -30729,7 +30758,9 @@ class LlamaCppBackend:
                     )
                     started = bool(self.load_model(fallback))
                     if not started:
-                        logger.info("MTP-crash reload stopped before the replacement was ready.")
+                        logger.info(
+                            "Speculative-crash reload stopped before the replacement was ready."
+                        )
                         return
                     undo_reload = False
                     with self._lock:
@@ -30751,12 +30782,10 @@ class LlamaCppBackend:
                             self._requested_spec_mode = _canonicalize_spec_mode(requested_mode)
                             self._spec_fallback_reason = "runtime_error"
                     if undo_reload:
-                        logger.info(
-                            "MTP-crash reload undone: the model was unloaded during reload."
-                        )
+                        logger.info("Speculative-crash reload undone: the model was unloaded during reload.")
                         self.unload_model()
                         return
-                logger.info("Reloaded without MTP after the tensor-parallel crash.")
+                logger.info("Reloaded without the speculative drafter after a process crash.")
             except Exception as e:
                 logger.error(f"Reload without MTP failed: {e}")
             finally:
@@ -30774,11 +30803,10 @@ class LlamaCppBackend:
         return True
 
     def _start_mtp_crash_watchdog(self) -> None:
-        """Background poll that recovers on an MTP+tensor crash even when no
-        request observes it (direct proxy endpoints, or nothing in flight).
+        """Watch a live multi-token drafter for a silent process death.
 
-        Armed only for a live MTP+tensor launch; the no-MTP reload disarms it, so
-        it can't loop.
+        This covers direct proxy endpoints and idle periods where no request
+        observes the exit. The no-drafter reload disarms it, so it cannot loop.
         """
         if not self._mtp_runtime_fallback_active:
             return

@@ -120,6 +120,7 @@ import {
   isMultimodalResponse,
 } from "../types/api";
 import { isExternalModelId } from "../external-providers";
+import { preferQwen38MacNativeContext } from "@/lib/qwen38-v11";
 import {
   DEFAULT_MAX_SEQ_LENGTH,
   DEFAULT_PER_MODEL_CONFIG,
@@ -998,6 +999,11 @@ export function useChatModelRuntime() {
                 ),
                 defaultMaxSeqLength: live.params.maxSeqLength || DEFAULT_MAX_SEQ_LENGTH,
                 presetSource: live.activePresetSource,
+                preferNativeContext: preferQwen38MacNativeContext({
+                  modelId,
+                  isGguf: residentIsGguf,
+                  deviceType: platform.deviceType,
+                }),
               });
             },
             parallelSlots: managedFlags?.defaultParallelSlots || null,
@@ -1508,6 +1514,11 @@ export function useChatModelRuntime() {
                   DEFAULT_MAX_SEQ_LENGTH,
                 ),
                 presetSource: loadActivePresetSource,
+                preferNativeContext: preferQwen38MacNativeContext({
+                  modelId,
+                  isGguf,
+                  deviceType: platform.deviceType,
+                }),
               }),
             );
             const validation = await validateModel({
@@ -1721,11 +1732,16 @@ export function useChatModelRuntime() {
               isMlx: targetIsMlx,
               pinnedMaxSeqLength,
               defaultMaxSeqLength: unpinnedDefaultRequest(
-                  previousIsMlx,
-                  stateBeforeUnload.params.maxSeqLength,
-                  DEFAULT_MAX_SEQ_LENGTH,
-                ),
+                previousIsMlx,
+                stateBeforeUnload.params.maxSeqLength,
+                DEFAULT_MAX_SEQ_LENGTH,
+              ),
               presetSource: loadActivePresetSource,
+              preferNativeContext: preferQwen38MacNativeContext({
+                modelId,
+                isGguf,
+                deviceType: platform.deviceType,
+              }),
             });
             const loadMaxSeqLength = resolveFitMaxSeqLength(
               isGguf,

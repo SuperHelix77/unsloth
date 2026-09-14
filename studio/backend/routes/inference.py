@@ -79,6 +79,12 @@ from utils.api_errors import openai_error_body, anthropic_error_body, error_body
 from utils.audio_tokens import GGUF_TTS_AUDIO_TYPES as _GGUF_TTS_AUDIO_TYPES
 from utils.upload_limits import STT_AUDIO_B64_MAX_CHARS, STT_AUDIO_RAW_MAX_BYTES
 from hub.dependencies import get_hf_token, get_request_hf_token
+from core.inference.q38_v11_optimization import (
+    q38_v11_default_extra_args,
+    q38_v11_default_load_updates,
+    q38_v11_default_parallel_slots,
+    q38_v11_is_qwen38,
+)
 from hub.utils.hf_tokens import HfTokenArg
 from hub.services.models.ollama import (
     acquire_ollama_model_ref,
@@ -4812,7 +4818,7 @@ _TOOL_CODE_TIP = (
 # "no, I am sandboxed" from training data rather than reading its own tool list,
 # so the environment is stated outright and the guess sent to a tool call.
 # Fixed order so the sentence reads the same whichever way the caller listed them.
-_LOCAL_CODE_TOOLS = ("python", "terminal", "edit_file")
+_LOCAL_CODE_TOOLS = ("python", "terminal", "edit_file", "computer")
 
 
 def _full_access_tip(code_tools: list[str]) -> str:
@@ -13109,10 +13115,15 @@ class _NoParallelRequest:
 
 
 def _resolve_parallel_slots(request, fastapi_request: Optional[Request]) -> int:
-    if request.n_parallel is not None:
-        return request.n_parallel
+    # Apple unified memory pays the KV-cache cost once per slot. A four-slot default is a poor
+    # fit for long-context GGUFs and was the reason a 262K-native model collapsed to 8K on Macs.
+    # Keep an explicit request authoritative; users who need concurrency can still choose it.
     state = getattr(getattr(fastapi_request, "app", None), "state", None)
-    return getattr(state, "llama_parallel_slots", 1)
+    return q38_v11_default_parallel_slots(
+        sys.platform,
+        request.n_parallel,
+        getattr(state, "llama_parallel_slots", 1),
+    )
 
 
 def _effective_parallel_slots(n_parallel: int, *, diffusion_kind: Optional[bool] = None) -> int:
@@ -14211,11 +14222,34 @@ def _mlx_runtime_settings_match(backend, request) -> bool:
     entry = backend.models.get(backend.active_model_name, {}) or {}
     if "mlx_kv_bits_requested" not in entry:
         return True
-    from core.inference.mlx_inference import _normalize_mlx_kv_bits
+    from core.inference.mlx_inference import (
+        MLXInferenceBackend,
+        _normalize_mlx_kv_bits,
+    )
 
-    return entry["mlx_kv_bits_requested"] == _normalize_mlx_kv_bits(request.mlx_kv_bits) and (
-        entry.get("chat_template_override_requested") or None
-    ) == (request.chat_template_override or None)
+    requested_spec = MLXInferenceBackend._normalize_mlx_speculative_type(
+        getattr(request, "speculative_type", None)
+    )
+    spec_match = entry.get(
+        "speculative_requested_type", entry.get("speculative_type", "auto")
+    ) == requested_spec
+    draft_path_match = (
+        getattr(request, "spec_draft_model_path", None) is None
+        or entry.get("spec_draft_model_path_requested")
+        == str(request.spec_draft_model_path).strip()
+    )
+    draft_depth_match = (
+        requested_spec not in {"dflash", "dflare"}
+        or entry.get("spec_draft_n_max") == getattr(request, "spec_draft_n_max", None)
+    )
+    return (
+        spec_match
+        and draft_path_match
+        and draft_depth_match
+        and entry["mlx_kv_bits_requested"] == _normalize_mlx_kv_bits(request.mlx_kv_bits)
+        and (entry.get("chat_template_override_requested") or None)
+        == (request.chat_template_override or None)
+    )
 
 
 def _non_gguf_runtime_settings_match(backend, request) -> bool:
@@ -14712,6 +14746,21 @@ async def _load_model_impl(
                 resolved_ollama_path = resolved_ollama_path,
             )
         )
+        # Q38 V1.1 is scoped to Qwen3.8 on Apple unified memory. The previous GGUF
+        # auto path selected a ~8K window for this family even though the model is
+        # trained for 262K. Apply only automatic sentinels here; positive settings
+        # remain user-owned and unrelated models retain their existing policy.
+        q38_updates = q38_v11_default_load_updates(
+            model_identifier,
+            platform_name = sys.platform,
+            max_seq_length = request.max_seq_length,
+            cache_type_kv = request.cache_type_kv,
+            speculative_type = request.speculative_type,
+            n_batch = request.n_batch,
+            n_ubatch = request.n_ubatch,
+        )
+        if q38_updates:
+            request = request.model_copy(update = q38_updates)
         if native_access_deferred:
             await asyncio.to_thread(account_access.require_model_access, model_identifier)
 
@@ -14887,6 +14936,10 @@ async def _load_model_impl(
                     ),
                     max_context_length = _positive_int_or_none(_model_info.get("max_context_length")),
                     context_length_enforced = _model_info.get("context_length_enforced"),
+                    speculative_type = _model_info.get("speculative_type"),
+                    spec_drafter_kind = _model_info.get("spec_drafter_kind"),
+                    spec_draft_n_max = _model_info.get("spec_draft_n_max"),
+                    spec_fallback_reason = _model_info.get("spec_fallback_reason"),
                     chat_template = _chat_template,
                 )
 
@@ -14918,6 +14971,15 @@ async def _load_model_impl(
                 status_code = 400,
                 detail = f"Invalid model identifier: {model_log_label}",
             )
+        if (
+            config.is_gguf
+            and isinstance(request.speculative_type, str)
+            and request.speculative_type.strip().lower() in {"dflare", "draft-dflare"}
+        ):
+            raise HTTPException(
+                status_code = 400,
+                detail = "DFlare is available on the native MLX path for safetensors models; use DFlash for GGUF.",
+            )
         await asyncio.to_thread(_require_resolved_base_access, config)
 
         # Resolve inherited extras once before command-dependent preflights.
@@ -14928,6 +14990,16 @@ async def _load_model_impl(
             extra_llama_args,
             effective_chat_template_override,
         )
+        extra_llama_args = q38_v11_default_extra_args(
+            model_identifier,
+            extra_llama_args,
+            platform_name = sys.platform,
+        )
+        # Keep inherited extras local to the launch for unrelated models. The scoped
+        # Q38 policy needs its effective --kv-unified default reflected on the request
+        # because later placement/preflight helpers inspect the request fields directly.
+        if q38_v11_is_qwen38(model_identifier) and sys.platform == "darwin":
+            request = request.model_copy(update = {"llama_extra_args": extra_llama_args})
 
         # Invalid GPU IDs must fail before the training coexistence guard.
         placement = await _prepare_load_placement(config, request, extra_llama_args)
@@ -15524,6 +15596,9 @@ async def _load_model_impl(
                 subject = current_subject,
                 mlx_kv_bits = request.mlx_kv_bits,
                 chat_template_override = request.chat_template_override,
+                speculative_type = request.speculative_type,
+                spec_draft_n_max = request.spec_draft_n_max,
+                spec_draft_model_path = request.spec_draft_model_path,
                 load_cancel_event = load_cancel_event,
                 on_prior_worker_released = _release_chat_after_teardown,
                 post_handoff_expected_free_gb = post_chat_handoff_expected_free_gb,
@@ -15676,6 +15751,10 @@ async def _load_model_impl(
             native_context_length = _positive_int_or_none(_model_info.get("native_context_length")),
             max_context_length = _positive_int_or_none(_model_info.get("max_context_length")),
             context_length_enforced = _model_info.get("context_length_enforced"),
+            speculative_type = _model_info.get("speculative_type"),
+            spec_drafter_kind = _model_info.get("spec_drafter_kind"),
+            spec_draft_n_max = _model_info.get("spec_draft_n_max"),
+            spec_fallback_reason = _model_info.get("spec_fallback_reason"),
             chat_template = _chat_template,
         )
 
@@ -17874,6 +17953,10 @@ async def get_status(current_subject: str = Depends(get_current_subject)):
             native_context_length = _positive_int_or_none(model_info.get("native_context_length")),
             max_context_length = _positive_int_or_none(model_info.get("max_context_length")),
             context_length_enforced = model_info.get("context_length_enforced"),
+            speculative_type = model_info.get("speculative_type"),
+            spec_drafter_kind = model_info.get("spec_drafter_kind"),
+            spec_draft_n_max = model_info.get("spec_draft_n_max"),
+            spec_fallback_reason = model_info.get("spec_fallback_reason"),
             # 0 is an answer (size it yourself); None means no request is recorded. Either
             # spelling: the route stamps max_seq_length_requested on every non-GGUF load,
             # and the MLX mirror carries requested_context_length.

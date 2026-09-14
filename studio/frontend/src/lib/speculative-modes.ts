@@ -9,17 +9,31 @@
  * feature-boundary lint rule bans deep imports, and the barrel pulls the
  * picker's components back into an eval-time cycle with chat).
  *
- * Mirrors the backend's _CANONICAL_SPEC_MODES (core/inference/llama_cpp.py).
+ * Mirrors the backend's accepted speculative vocabulary. DFlare is native
+ * MLX-only; the llama.cpp canonical set remains unchanged.
  */
 export const SPECULATIVE_TYPES = [
   "auto",
   "mtp",
   "dspark",
   "dflash",
+  "dflare",
   "ngram",
   "mtp+ngram",
   "off",
 ] as const;
+
+/**
+ * Modes that are useful to try on a compatible model, but are not part of the
+ * measured Qwen3.8 v1.1 default. Selecting one is an explicit opt-in: the
+ * target still verifies the drafter, and the backend falls back to ordinary
+ * decoding if the sidecar or runtime cannot support it.
+ */
+export const EXPERIMENTAL_SPECULATIVE_TYPES: ReadonlySet<string> = new Set([
+  "mtp",
+  "dflash",
+  "dflare",
+]);
 
 /**
  * The modes that consume spec_draft_n_max, i.e. the ones that launch a drafter
@@ -32,6 +46,7 @@ export const DRAFT_N_MAX_SPEC_TYPES: ReadonlySet<string> = new Set([
   "mtp+ngram",
   "dspark",
   "dflash",
+  "dflare",
 ]);
 
 /**
@@ -47,4 +62,5 @@ export const DRAFT_N_MAX_SPEC_TYPES: ReadonlySet<string> = new Set([
 export const SEPARATE_DRAFT_MODEL_SPEC_TYPES: ReadonlySet<string> = new Set([
   "dspark",
   "dflash",
+  "dflare",
 ]);

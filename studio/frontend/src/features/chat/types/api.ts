@@ -66,13 +66,13 @@ export interface LoadModelRequest {
   chat_template_override?: string | null;
   cache_type_kv?: string | null;
   mlx_kv_bits?: number | null;
-  /** Speculative decoding mode for GGUF models: "auto" (platform-aware DSpark/DFlash when the model
-   *  ships that sidecar, else MTP on MTP GGUFs, ngram-mod for sub-3B), "mtp", "dspark",
-   *  "dflash", "ngram", "mtp+ngram", "off". The legacy spellings are still accepted. */
+  /** Speculative decoding mode: GGUF uses llama.cpp; native safetensors on Apple Silicon also
+   *  supports DFlash and DFlare. */
   speculative_type?: string | null;
-  /** Override --spec-draft-n-max for drafter speculative decoding. Applied only when speculative_type
-   *  resolves to "mtp", "mtp+ngram", "dspark" or "dflash". */
+  /** Override speculative drafter depth. Applied to MTP/DSpark/DFlash/DFlare modes. */
   spec_draft_n_max?: number | null;
+  /** Optional native MLX DFlash/DFlare draft checkpoint or Hugging Face repo. */
+  spec_draft_model_path?: string | null;
   /** Parallel decode slots for llama-server (--parallel), 1..64. Omit/null = the launch default. The
    *  VRAM fitter may launch fewer to stay on GPU. */
   n_parallel?: number | null;
