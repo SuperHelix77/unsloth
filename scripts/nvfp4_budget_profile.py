@@ -651,6 +651,43 @@ def _resolve_guidance(args, model):
     return guidance
 
 
+def generation_kwargs(args, guidance) -> dict:
+    """The ``backend.generate`` kwargs for one render.
+
+    ``--negative-prompt`` belongs to both backends: the image backend's ``generate`` takes it
+    (diffusion.py:5744) and a run that parsed it but dropped it here would render the
+    positive-only case under the label of the requested one."""
+    if args.backend == "video":
+        width, height = (
+            (int(x) for x in str(args.resolution).split("x"))
+            if "x" in str(args.resolution)
+            else (args.resolution, args.resolution)
+        )
+        kwargs = dict(
+            prompt = args.prompt,
+            width = width,
+            height = height,
+            steps = args.steps,
+            guidance = guidance,
+            seed = args.seed,
+        )
+        if args.frames:
+            kwargs["num_frames"] = args.frames
+    else:
+        kwargs = dict(
+            prompt = args.prompt,
+            width = int(args.resolution),
+            height = int(args.resolution),
+            steps = args.steps,
+            guidance = guidance,
+            seed = args.seed,
+            batch_size = 1,
+        )
+    if args.negative_prompt:
+        kwargs["negative_prompt"] = args.negative_prompt
+    return kwargs
+
+
 def main(argv = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--backend", default = "image", choices = ("image", "video"))
@@ -943,34 +980,8 @@ def run_one(args, graphs: str, pre: dict, root: str, out_path: Path) -> int:
 
         guidance = _resolve_guidance(args, args.model)
         record["guidance"] = guidance
-        if args.backend == "video":
-            width, height = (
-                (int(x) for x in str(args.resolution).split("x"))
-                if "x" in str(args.resolution)
-                else (args.resolution, args.resolution)
-            )
-            gen_kwargs = dict(
-                prompt = args.prompt,
-                width = width,
-                height = height,
-                steps = args.steps,
-                guidance = guidance,
-                seed = args.seed,
-            )
-            if args.frames:
-                gen_kwargs["num_frames"] = args.frames
-            if args.negative_prompt:
-                gen_kwargs["negative_prompt"] = args.negative_prompt
-        else:
-            gen_kwargs = dict(
-                prompt = args.prompt,
-                width = int(args.resolution),
-                height = int(args.resolution),
-                steps = args.steps,
-                guidance = guidance,
-                seed = args.seed,
-                batch_size = 1,
-            )
+        gen_kwargs = generation_kwargs(args, guidance)
+        record["negative_prompt"] = gen_kwargs.get("negative_prompt")
 
         # Final pre-VAE latent, for the bit-identity / max-abs comparisons between arms. Cloned
         # only while ``latent_box["arm"]`` is set, so the steady timing renders pay nothing.

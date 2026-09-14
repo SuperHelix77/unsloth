@@ -23,6 +23,25 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 
+def eager_decode_of(decode):
+    """``decode`` with every ``torch.compile`` wrapper peeled off, and whether one was peeled.
+
+    ``UNSLOTH_DIFFUSION_COMPILE_VAE=0`` does not reach a U-Net pipe: ``_vae_decode_compile_allowed``
+    returns True for one before it reads the env (diffusion_speed.py:592-595), so the load hands
+    back an already compiled ``vae.decode`` and the eager arm would be compiled against compiled.
+    ``torch.compile`` keeps the original on ``_torchdynamo_orig_callable`` and marks the wrapper
+    with ``_torchdynamo_wrapper_id``; a ``functools.wraps`` copy carries the attribute without the
+    matching id, which is why torch's own ``innermost_fn`` checks it (torch/_dynamo/eval_frame.py:
+    619-641, 1106-1107)."""
+    eager = decode
+    while hasattr(eager, "_torchdynamo_orig_callable"):
+        wrapper_id = getattr(eager, "_torchdynamo_wrapper_id", None)
+        if wrapper_id is not None and wrapper_id != id(eager):
+            break
+        eager = eager._torchdynamo_orig_callable
+    return eager, eager is not decode
+
+
 def main(argv = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--family", required = True)
@@ -102,7 +121,14 @@ def main(argv = None) -> int:
         vae.decode, "_torchdynamo_orig_callable"
     )
 
-    eager_decode = vae.decode
+    loaded_decode = vae.decode
+    eager_decode, unwrapped = eager_decode_of(loaded_decode)
+    rec["eager_decode_unwrapped"] = unwrapped
+    if rec["decode_compiled_on_load"] and not unwrapped:
+        raise RuntimeError(
+            "the load compiled vae.decode and no eager callable could be recovered: "
+            "an eager arm cannot be measured on this pipeline"
+        )
     captured: dict = {}
 
     def capture(*a, **k):
@@ -124,7 +150,7 @@ def main(argv = None) -> int:
         batch_size = 1,
     )
     backend.generate(**gen_kwargs)
-    vae.decode = eager_decode
+    vae.decode = loaded_decode
     if captured.get("latent") is None:
         raise RuntimeError("no VAE decode call captured")
     latent = captured["latent"]

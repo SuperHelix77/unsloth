@@ -4,8 +4,10 @@
 
 """Attention backend A/B on the real shipped Studio image path.
 
-One process, one load, all backends resident, paired by seed in a round robin, because the enemy
-here is drift: two backends measured in two processes differ by whatever else the box was doing.
+One process, one load, all backends resident, paired by seed in a round robin whose starting
+backend rotates every round, because the enemy here is drift: two backends measured in two
+processes differ by whatever else the box was doing, and a fixed order inside one process pins
+each backend to the same position in every round.
 
 The graph makes the rotation expensive. A captured CUDA graph BAKED the attention
 kernel that was live at capture time, and the compiled block guards on
@@ -59,6 +61,19 @@ def observed_backends(modules) -> list[str]:
             if value is not None:
                 seen.add(str(getattr(value, "value", value)))
     return sorted(seen)
+
+
+def rotated(labels: list, rot: int) -> list:
+    """The measurement order of round ``rot``, starting one backend further along each round.
+
+    A fixed order leaves backend identity correlated with position in the round, so any thermal or
+    clock drift across the round lands on the same backend every time; pairing by seed does not
+    remove that. Every backend still renders once per round at that round's seed, so the paired
+    deltas stay paired by round."""
+    if not labels:
+        return []
+    start = rot % len(labels)
+    return labels[start:] + labels[:start]
 
 
 def switch_failure(info: dict) -> str | None:
@@ -278,9 +293,12 @@ def main(argv = None) -> int:
             for label in sorted(dropped)
         }
 
+        record["rotation_orders"] = []
         for rot in range(args.rotations):
             seed = args.seed_base + rot
-            for label in live:
+            order = rotated(live, rot)
+            record["rotation_orders"].append(order)
+            for label in order:
                 info = switch(label)
                 failure = switch_failure(info)
                 if failure is not None:
@@ -295,8 +313,8 @@ def main(argv = None) -> int:
                 if want_numerics and latent_box["tensor"] is not None:
                     per_backend[label]["latent"] = latent_box["tensor"].cpu()
             print(
-                f"[ab] rot {rot}: "
-                + "  ".join(f"{b}={per_backend[b]['times'][-1]:.4f}" for b in live),
+                f"[ab] rot {rot} ({','.join(order)}): "
+                + "  ".join(f"{b}={per_backend[b]['times'][-1]:.4f}" for b in order),
                 flush = True,
             )
             flush()

@@ -348,3 +348,80 @@ def test_each_graph_arm_gets_its_output_directory_created(tmp_path, monkeypatch)
     for _graphs, _verdict, path in seen:
         assert path.read_text() == "{}\n"
     assert not (tmp_path / "results" / "{graphs}").exists()
+
+
+def _gen_args(**overrides):
+    import argparse
+
+    base = dict(
+        backend = "image",
+        prompt = "a red sailboat",
+        resolution = "1024",
+        steps = 8,
+        seed = 1234,
+        frames = None,
+        negative_prompt = None,
+    )
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def test_the_image_path_renders_with_the_negative_prompt_it_was_given():
+    # The image backend's generate() takes negative_prompt; parsing --negative-prompt and then
+    # dropping it renders the positive-only case under the label of the requested one.
+    profile = _script("nvfp4_budget_profile")
+    image = profile.generation_kwargs(_gen_args(negative_prompt = "blurry, watermark"), 4.0)
+    assert image["negative_prompt"] == "blurry, watermark"
+    assert image["batch_size"] == 1
+    video = profile.generation_kwargs(
+        _gen_args(
+            backend = "video",
+            resolution = "1280x704",
+            frames = 121,
+            negative_prompt = "blurry, watermark",
+        ),
+        5.0,
+    )
+    assert video["negative_prompt"] == "blurry, watermark"
+    assert (video["width"], video["height"], video["num_frames"]) == (1280, 704, 121)
+    assert "negative_prompt" not in profile.generation_kwargs(_gen_args(), 4.0)
+
+
+def test_the_attention_ab_starts_a_different_backend_each_round():
+    # A fixed order pins each backend to the same position in every round, so drift across the
+    # round lands on the same one every time; pairing by seed does not remove that.
+    ab = _script("nvfp4_budget_attention_ab")
+    live = ["cudnn", "flash", "efficient"]
+    orders = [ab.rotated(live, rot) for rot in range(4)]
+    assert orders[0] == live
+    assert len({tuple(o) for o in orders[:3]}) == 3
+    assert [o[0] for o in orders] == ["cudnn", "flash", "efficient", "cudnn"]
+    for order in orders:
+        assert sorted(order) == sorted(live)
+    assert ab.rotated([], 2) == []
+
+
+def test_the_vae_numerics_eager_arm_unwraps_a_decode_compiled_at_load():
+    # UNSLOTH_DIFFUSION_COMPILE_VAE=0 is ignored for a U-Net pipe, so the load can hand back a
+    # compiled vae.decode; timing that as the eager arm compares compiled against compiled.
+    numerics = _script("nvfp4_budget_vae_numerics")
+
+    def decode(latent):
+        return latent
+
+    def wrapper(latent):
+        return decode(latent)
+
+    wrapper._torchdynamo_orig_callable = decode
+    wrapper._torchdynamo_wrapper_id = id(wrapper)
+    eager, unwrapped = numerics.eager_decode_of(wrapper)
+    assert (eager, unwrapped) == (decode, True)
+    assert numerics.eager_decode_of(decode) == (decode, False)
+
+    def copied(latent):
+        return decode(latent)
+
+    # A functools.wraps copy carries the attribute without the matching id and is not a wrapper.
+    copied._torchdynamo_orig_callable = decode
+    copied._torchdynamo_wrapper_id = id(wrapper)
+    assert numerics.eager_decode_of(copied) == (copied, False)
