@@ -120,8 +120,7 @@ def global_scale(t: Any):
     return (FP4_MAX * FP8_MAX / t.float().abs().amax().clamp(min = 1e-8)).reshape(1).to(t.device)
 
 
-# Exposed as plain functions as well as through ``torch.ops`` so that a test can assert the call
-# ORDER inside them, which is what the barrier below rests on.
+# Exposed as plain functions as well as through ``torch.ops`` so that a test can assert the call ORDER inside them, which is what the barrier below rests on.
 
 
 def _quantize_impl(x: Any, global_sf: Any):
@@ -163,8 +162,7 @@ def _mm_impl(xq: Any, wq: Any, x_sf: Any, w_sf: Any, alpha: Any, n: int, backend
         else:
             out = torch.empty(m, n, device = xq.device, dtype = torch.bfloat16)
             _fire_barrier(xq.device)
-        # The cached dispatch: same tactic the AutoTuner would choose, minus the per-call runner
-        # rebuild. Anything unverified returns None and the public entry point runs.
+        # Same tactic the AutoTuner would choose, minus the per-call runner rebuild; unverified returns None.
         if dispatch.enabled(xq.device):
             wq_t, w_sf_t = dispatch.transposed(wq), dispatch.transposed(w_sf)
             plan = dispatch.gemm_plan(xq, wq_t, x_sf, w_sf_t, alpha, out, n, backend)
@@ -394,8 +392,7 @@ def nvfp4_preflight(device: Any = None, *, refresh: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001 - every failure mode here means "use torchao"
         rec["reason"] = f"{type(exc).__name__}: {str(exc)[:200]}"
         if _transient_preflight_failure(exc):
-            # Not memoised: the probe runs during AUTO planning while the model the arbiter is about
-            # to evict still owns the card, so an allocation failure says "not now", not "not here".
+            # Not memoised: the probe runs during AUTO planning while the model the arbiter is about to evict still owns the card, so an allocation failure says "not now", not "not here".
             return dict(rec)
 
     with _PREFLIGHT_LOCK:
