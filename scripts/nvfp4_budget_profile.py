@@ -712,22 +712,24 @@ def main(argv = None) -> int:
     if args.arm == "nvfp4":
         os.environ["UNSLOTH_NVFP4_BACKEND"] = args.nvfp4_backend
 
-    out_dir = Path(args.out).parent
-    out_dir.mkdir(parents = True, exist_ok = True)
-    args.trace_dir = args.trace_dir or str(out_dir / "traces")
-    Path(args.trace_dir).mkdir(parents = True, exist_ok = True)
-
     graph_arms = ["on", "off"] if args.graphs == "both" else [args.graphs]
     if args.graphs == "both" and "{graphs}" not in args.out:
         print("--graphs both needs a {graphs} placeholder in --out", flush = True)
         return 2
 
-    pre = contention_check("pre", str(out_dir))
-    print(f"[contention pre] {pre['verdict']} slice_ratio={pre['slice_ratio']:.2f}", flush = True)
+    both = args.graphs == "both"
+    arm_paths = [Path(arm_path(args.out, graphs, both = both)) for graphs in graph_arms]
+    args.trace_dir = args.trace_dir or str(arm_paths[0].parent / "traces")
+    Path(args.trace_dir).mkdir(parents = True, exist_ok = True)
 
     rc = 0
-    for graphs in graph_arms:
-        rc |= run_one(args, graphs, pre, str(root))
+    for graphs, out_path in zip(graph_arms, arm_paths):
+        # Per arm, not once: {graphs} may sit in a directory component, and a neighbour that
+        # arrives during the first arm only falls inside the second arm's bookend.
+        out_path.parent.mkdir(parents = True, exist_ok = True)
+        pre = contention_check("pre", str(out_path.parent))
+        print(f"[contention pre] {pre['verdict']} slice_ratio={pre['slice_ratio']:.2f}", flush = True)
+        rc |= run_one(args, graphs, pre, str(root), out_path)
     return rc
 
 
@@ -743,7 +745,7 @@ def arm_path(template: str, graphs: str, *, both: bool) -> str:
     return str(stem.with_name(f"{stem.stem}_graphs{graphs}{stem.suffix}"))
 
 
-def run_one(args, graphs: str, pre: dict, root: str) -> int:
+def run_one(args, graphs: str, pre: dict, root: str, out_path: Path) -> int:
     import torch
 
     os.environ.pop("UNSLOTH_DISABLE_CUDA_GRAPH", None)
@@ -757,7 +759,6 @@ def run_one(args, graphs: str, pre: dict, root: str) -> int:
     if args.tag and both:
         # An explicit tag names the cell, not the arm, so both arms would share one trace file.
         tag = f"{tag}_graphs{graphs}"
-    out_path = Path(arm_path(args.out, graphs, both = both))
     trace_path = Path(args.trace_dir) / f"{tag}.json"
     record: dict = {
         "tag": tag,

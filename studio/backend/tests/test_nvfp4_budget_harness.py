@@ -270,3 +270,81 @@ def test_compile_off_loads_the_eager_tier_rather_than_relabelling_a_compiled_run
     assert profile.resolve_load_speed_mode("off", "max") == "eager"
     assert profile.resolve_load_speed_mode("regional", "default") == "default"
     assert profile.resolve_load_speed_mode("whole", "max") == "max"
+
+
+def _both_arms_argv(tmp_path, out: str) -> list:
+    return [
+        "--family",
+        "z-image",
+        "--model",
+        "m",
+        "--arm",
+        "fp8",
+        "--steps",
+        "4",
+        "--graphs",
+        "both",
+        "--backend-root",
+        str(tmp_path / "backend"),
+        "--out",
+        out,
+    ]
+
+
+def _patched_main(profile, monkeypatch, checks: list, seen: list):
+    """``main`` with the two GPU-touching calls replaced, so the per-arm bookkeeping is testable."""
+
+    def fake_check(tag, out_dir):
+        checks.append((tag, out_dir))
+        return {"verdict": "clean" if len(checks) == 1 else "CONTENDED", "slice_ratio": 1.0}
+
+    def fake_run_one(
+        args,
+        graphs,
+        pre,
+        root,
+        out_path = None,
+    ):
+        if out_path is None:
+            out_path = profile.arm_path(args.out, graphs, both = args.graphs == "both")
+        seen.append((graphs, pre["verdict"], Path(out_path)))
+        Path(out_path).write_text("{}\n")
+        return 0
+
+    monkeypatch.setattr(profile, "contention_check", fake_check)
+    monkeypatch.setattr(profile, "run_one", fake_run_one)
+
+
+def test_each_graph_arm_takes_its_own_contention_pre_check(tmp_path, monkeypatch):
+    # One pre-check shared by both arms backdates the second arm's window: a neighbour that
+    # arrives during arm one and leaves before arm two's post-check marks arm two clean.
+    profile = _script("nvfp4_budget_profile")
+    checks: list = []
+    seen: list = []
+    _patched_main(profile, monkeypatch, checks, seen)
+    out = str(tmp_path / "cell_graphs{graphs}.json")
+    assert profile.main(_both_arms_argv(tmp_path, out)) == 0
+    assert [tag for tag, _dir in checks] == ["pre", "pre"]
+    assert [(graphs, verdict) for graphs, verdict, _p in seen] == [
+        ("on", "clean"),
+        ("off", "CONTENDED"),
+    ]
+
+
+def test_each_graph_arm_gets_its_output_directory_created(tmp_path, monkeypatch):
+    # {graphs} is allowed anywhere in --out, so the parent of the FORMATTED path is the one that
+    # has to exist; creating the template's parent leaves a literal {graphs} dir and the arm's
+    # first checkpoint write fails after the model has already loaded.
+    profile = _script("nvfp4_budget_profile")
+    checks: list = []
+    seen: list = []
+    _patched_main(profile, monkeypatch, checks, seen)
+    out = str(tmp_path / "results" / "{graphs}" / "cell.json")
+    assert profile.main(_both_arms_argv(tmp_path, out)) == 0
+    assert [p for _g, _v, p in seen] == [
+        tmp_path / "results" / "on" / "cell.json",
+        tmp_path / "results" / "off" / "cell.json",
+    ]
+    for _graphs, _verdict, path in seen:
+        assert path.read_text() == "{}\n"
+    assert not (tmp_path / "results" / "{graphs}").exists()
