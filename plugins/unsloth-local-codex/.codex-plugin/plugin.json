@@ -1,20 +1,20 @@
 {
   "name": "unsloth-local-codex",
-  "version": "0.1.0",
-  "description": "Local Codex workflow for Unsloth Studio with durable plans, goals, long-context Mac inference, and GitHub context.",
-  "author": { "name": "Unsloth Studio" },
+  "version": "0.1.0-beta",
+  "description": "Local Codex workflow for Unsloth Helix with durable goals and plans, GitHub context, long-context Mac inference, skills, memory, and governed learning.",
+  "author": { "name": "Unsloth Helix" },
   "skills": "./skills/",
   "interface": {
-    "displayName": "Unsloth Local Codex",
-    "shortDescription": "Local Codex workflow for Unsloth Studio.",
-    "longDescription": "Adds a reusable local workflow for Unsloth Studio: inspect GitHub ledgers, plan changes, execute durable goals, and validate Mac inference without embedding credentials.",
-    "developerName": "Unsloth Studio",
+    "displayName": "Unsloth Helix Local Codex",
+    "shortDescription": "Beta local Codex workflow for Unsloth Helix.",
+    "longDescription": "Adds a reusable local agent workflow for Unsloth Helix: inspect repository evidence, plan changes, execute durable goals, use portable skills and memory, and validate Mac inference changes without embedding credentials.",
+    "developerName": "Unsloth Helix",
     "category": "Productivity",
-    "capabilities": ["GitHub context", "Plan mode", "Goal mode", "Slash commands", "Mac inference"],
+    "capabilities": ["GitHub context", "Plan mode", "Goal mode", "Local skills", "Memory", "Mac inference"],
     "defaultPrompt": [
-      "Inspect the Unsloth v1.1 ledger and propose safe optimizations.",
+      "Inspect the active Helix runtime configuration and propose evidence-backed optimizations.",
       "Plan a Mac inference change and keep explicit user settings authoritative.",
-      "Audit a DFlash or MTP change against GitHub evidence."
+      "Audit an MTP or DFlash-family change against measured runtime evidence."
     ]
   },
   "mcpServers": "./.mcp.json"
