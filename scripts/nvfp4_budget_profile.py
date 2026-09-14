@@ -336,7 +336,11 @@ def classify(name: str, window: str | None) -> str:
         return "fp4_quantize"
     if "devicegemmfp4" in low or "gemmfp4" in low or "fp4gemm" in low:
         return "fp4_gemm"
-    if "fillfunctor" in low:
+    # The NVFP4 ordering barrier is a 1-element bf16 ``zero_()`` fired from ``_mm_impl`` (see
+    # ``diffusion_nvfp4_ops._fire_barrier``), so it is a bf16 FillFunctor inside the denoise window
+    # and nowhere else. A bare ``FillFunctor`` test also swallows the ordinary fills a pipeline,
+    # scheduler or VAE launches: the fp8 arms, which have no barrier at all, reported one.
+    if "fillfunctor<c10::bfloat16>" in low and window == "phase:denoise":
         return "barrier_fill"
     # fp8: torchao/cublas scaled_mm. ``nvjet_`` is cublasLt's SM100 GEMM family; inside the denoise
     # window on a quantised arm it is the scaled_mm, and outside it is somebody else's GEMM.
@@ -689,7 +693,8 @@ def main(argv = None) -> int:
     ap.add_argument(
         "--save-latent",
         default = None,
-        help = "write the final pre-VAE latent of the first timed render here",
+        help = "write the final pre-VAE latent of the first timed render here; under "
+        "--graphs both each arm gets its own file",
     )
     ap.add_argument("--negative-prompt", default = None)
     ap.add_argument("--gpu-uuid", default = None, help = "recorded; set CUDA_VISIBLE_DEVICES too")
@@ -726,6 +731,18 @@ def main(argv = None) -> int:
     return rc
 
 
+def arm_path(template: str, graphs: str, *, both: bool) -> str:
+    """Where one arm of a ``--graphs both`` run writes. ``{graphs}`` wherever the caller put it,
+    else the arm appended to the stem; a single-arm run keeps the path it was given. Without this
+    the second arm overwrites the first and both cells point at one file."""
+    if "{graphs}" in template:
+        return template.format(graphs = graphs)
+    if not both:
+        return template
+    stem = Path(template)
+    return str(stem.with_name(f"{stem.stem}_graphs{graphs}{stem.suffix}"))
+
+
 def run_one(args, graphs: str, pre: dict, root: str) -> int:
     import torch
 
@@ -733,10 +750,14 @@ def run_one(args, graphs: str, pre: dict, root: str) -> int:
     if graphs == "off":
         os.environ["UNSLOTH_DISABLE_CUDA_GRAPH"] = "1"
 
+    both = args.graphs == "both"
     tag = args.tag or (
         f"{args.family}_{args.resolution}_{args.arm}_graphs{graphs}" f"_{args.attention}"
     )
-    out_path = Path(args.out.format(graphs = graphs) if "{graphs}" in args.out else args.out)
+    if args.tag and both:
+        # An explicit tag names the cell, not the arm, so both arms would share one trace file.
+        tag = f"{tag}_graphs{graphs}"
+    out_path = Path(arm_path(args.out, graphs, both = both))
     trace_path = Path(args.trace_dir) / f"{tag}.json"
     record: dict = {
         "tag": tag,
@@ -1010,9 +1031,10 @@ def run_one(args, graphs: str, pre: dict, root: str) -> int:
                 "sum": float(lat.double().sum()),
             }
             if args.save_latent:
-                Path(args.save_latent).parent.mkdir(parents = True, exist_ok = True)
-                torch.save(lat.cpu(), args.save_latent)
-                record["latent"]["path"] = args.save_latent
+                latent_path = arm_path(args.save_latent, graphs, both = both)
+                Path(latent_path).parent.mkdir(parents = True, exist_ok = True)
+                torch.save(lat.cpu(), latent_path)
+                record["latent"]["path"] = latent_path
         record["unprofiled_s"] = [round(x, 5) for x in walls]
         record["p50_s"] = statistics.median(walls)
         record["min_s"] = min(walls)

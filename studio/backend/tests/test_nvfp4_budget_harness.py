@@ -48,6 +48,38 @@ def test_the_nvfp4_gemm_is_not_charged_to_attention():
     )
 
 
+def test_only_the_bf16_barrier_fill_is_charged_to_the_nvfp4_barrier():
+    # The fp8 arms fire no barrier at all, yet a bare "FillFunctor" test charged their ordinary
+    # fills to it (z-image fp8 reported 109 barrier fills per render, the same 109 the nvfp4 arm
+    # carries on top of its 306 fp4 GEMMs).
+    profile = _script("nvfp4_budget_profile")
+    barrier = (
+        "void at::native::vectorized_elementwise_kernel<8, at::native::FillFunctor<c10::BFloat16>,"
+        " std::array<char*, 1ul> >(int, at::native::FillFunctor<c10::BFloat16>,"
+        " std::array<char*, 1ul>)"
+    )
+    generic = (
+        "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>,"
+        " std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)"
+    )
+    assert profile.classify(barrier, "phase:denoise") == "barrier_fill"
+    assert profile.classify(barrier, None) == "elementwise_eager"
+    assert profile.classify(generic, "phase:denoise") == "elementwise_eager"
+    assert profile.classify(generic, "phase:vae") == "vae_decode"
+
+
+def test_each_graph_arm_writes_its_own_latent_and_trace():
+    # --graphs both runs two arms in one invocation: a shared path would leave the graphs-off
+    # tensor in the file both cells name, so the cross-arm comparison would compare it with itself.
+    profile = _script("nvfp4_budget_profile")
+    on = profile.arm_path("/tmp/z.pt", "on", both = True)
+    off = profile.arm_path("/tmp/z.pt", "off", both = True)
+    assert on != off
+    assert (on, off) == ("/tmp/z_graphson.pt", "/tmp/z_graphsoff.pt")
+    assert profile.arm_path("/tmp/z.pt", "on", both = False) == "/tmp/z.pt"
+    assert profile.arm_path("/tmp/z_{graphs}.pt", "off", both = True) == "/tmp/z_off.pt"
+
+
 def test_an_inductor_kernel_is_inductor_time_whatever_it_was_fused_from():
     profile = _script("nvfp4_budget_profile")
     fused = "triton_poi_fused__scaled_dot_product_cudnn_attention_add_7"
@@ -134,6 +166,41 @@ def test_the_summariser_reads_a_results_directory_and_recomputes_nothing(tmp_pat
     assert "| fp4_gemm | 8 | 12.50 | 3.1% |" in text
     assert "The card was shared." in text
     assert "cell_that_never_ran" not in text
+
+
+def _cell(tag: str, n_timed: int, n_profiled: int) -> str:
+    """One minimal cell JSON with the render counts the profiler actually recorded."""
+    walls = ", ".join(["0.5"] * n_timed)
+    profiled = ", ".join(["0.6"] * n_profiled)
+    return (
+        f'{{"tag": "{tag}", "arm": "fp8", "graphs": "on", "model": "m", "steps": 4,'
+        f' "resolution": "1024", "p50_s": 0.5, "min_s": 0.49, "gpu_busy_union_s": 0.4,'
+        f' "host_idle_s": 0.1, "gpu_busy_fraction_of_wall": 0.8, "clean": true,'
+        f' "profiler_overhead_ratio": 1.1, "phase_sync_overhead_s": 0.01,'
+        f' "unprofiled_s": [{walls}], "profiled_walls_s": [{profiled}],'
+        f' "contention": {{"pre": {{"verdict": "clean"}}, "post": {{"verdict": "clean"}}}},'
+        f' "buckets": {{}}, "attention_by_kernel": [], "memcpy_d2d":'
+        f' {{"calls_per_render": 2, "calls_per_step": 0.5, "ms_per_render": 0.1}}}}\n'
+    )
+
+
+def test_the_report_states_each_cells_own_render_counts(tmp_path):
+    # The video cells ran --timed 3 --profiled 1 next to the image cells' 7 and 2, so a fixed
+    # "median of 7 unprofiled renders" preamble mislabels the protocol of half the report.
+    summarise = _script("nvfp4_budget_summarise")
+    (tmp_path / "image_cell.json").write_text(_cell("image_cell", 7, 2))
+    (tmp_path / "video_cell.json").write_text(_cell("video_cell", 3, 1))
+    order = tmp_path / "order.txt"
+    order.write_text("image_cell\nvideo_cell\n")
+    out = tmp_path / "budget.md"
+    argv = ["--results-dir", str(tmp_path), "--out", str(out), "--order", str(order)]
+    assert summarise.main(argv) == 0
+    text = out.read_text()
+    assert "median of 7 unprofiled renders" not in text
+    assert "of 7 unprofiled renders" in text
+    assert "of 3 unprofiled renders" in text
+    assert "of 2 profiled" in text
+    assert "of 1 profiled" in text
 
 
 def test_every_harness_script_parses_its_arguments_without_a_gpu():

@@ -6,8 +6,8 @@
 
 Reads only, and recomputes nothing: every number in the report is a field of a cell JSON, so the
 report can be regenerated from the artifacts without a GPU. Cells are emitted in ``--order`` (a file
-of tags, one per line) when given, otherwise in filename order; ``--notes FILE`` splices a prose
-file in after the index table, which is where the run's caveats belong.
+of tags, one per line) when given, otherwise in the built-in image-pass order; ``--notes FILE``
+splices a prose file in after the index table, which is where the run's caveats belong.
 """
 
 from __future__ import annotations
@@ -86,10 +86,12 @@ def main(argv = None) -> int:
     lines = [f"# {args.title}", ""]
     lines += [
         "Per-render GPU time budget for the shipped Studio image path, one process per cell,",
-        "`scripts/nvfp4_budget_profile.py`. Wall is the median of 7 unprofiled renders;",
-        "GPU busy is the UNION of device-side intervals over the 2 profiled renders (summing",
+        "`scripts/nvfp4_budget_profile.py`. Wall is the median of the cell's unprofiled renders;",
+        "GPU busy is the UNION of device-side intervals over its profiled renders (summing",
         "durations double counts overlapping streams); host idle is wall minus busy. Bucket shares",
-        "are of GPU busy, so they do not sum to 100 when kernels overlap.",
+        "are of GPU busy, so they do not sum to 100 when kernels overlap. Render counts are per",
+        "cell (`--timed` / `--profiled` differ between the image and video passes) and each cell",
+        "states its own below.",
         "",
     ]
     index = [
@@ -121,8 +123,10 @@ def main(argv = None) -> int:
             f"speed_optims {d.get('speed_optims')} | cuda_graph_reason "
             f"`{d.get('cuda_graph_reason')}` | graph stats {d.get('cuda_graph_stats')}",
             "",
-            f"p50 wall **{fmt(d['p50_s'])} s** (min {fmt(d['min_s'])}) | GPU busy "
-            f"**{fmt(d['gpu_busy_union_s'])} s** | host idle **{fmt(d['host_idle_s'])} s** | "
+            f"p50 wall **{fmt(d['p50_s'])} s** (min {fmt(d['min_s'])}) of "
+            f"{len(d.get('unprofiled_s') or [])} unprofiled renders | GPU busy "
+            f"**{fmt(d['gpu_busy_union_s'])} s** of {len(d.get('profiled_walls_s') or [])} "
+            f"profiled | host idle **{fmt(d['host_idle_s'])} s** | "
             f"profiler overhead x{d['profiler_overhead_ratio']:.2f} | phase-sync overhead "
             f"{fmt(d['phase_sync_overhead_s'])} s | contention pre/post "
             f"{d['contention']['pre']['verdict']}/{d['contention']['post']['verdict']}",
