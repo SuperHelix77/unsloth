@@ -401,13 +401,21 @@ def main(argv = None) -> int:
         import traceback
 
         traceback.print_exc()
-        record["contention"]["post"] = PG.contention_check("post", str(out_path.parent))
-        flush(exc)
+        # Unload FIRST, and keep the bookend best-effort: it allocates two 8192x8192 tensors, so after
+        # an OOM it raises in turn and the failure record is never written.
         try:
             if backend is not None:
                 backend.unload()
         except Exception:  # noqa: BLE001
             pass
+        try:
+            record["contention"]["post"] = PG.contention_check("post", str(out_path.parent))
+        except Exception as post_exc:  # noqa: BLE001
+            record["contention"]["post"] = {
+                "verdict": "unavailable",
+                "error": f"{type(post_exc).__name__}: {str(post_exc)[:200]}",
+            }
+        flush(exc)
         return 1
     post = PG.contention_check("post", str(out_path.parent))
     record["contention"]["post"] = post

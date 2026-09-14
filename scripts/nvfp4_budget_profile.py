@@ -672,7 +672,8 @@ def _resolve_guidance(args, model):
     image table, so asking it would profile Wan at guidance 0.0 with CFG off."""
     if args.guidance is not None:
         return args.guidance
-    if args.backend == "video":
+    # getattr: the numerics and A/B drivers share this helper and parse no --backend of their own.
+    if getattr(args, "backend", "image") == "video":
         from core.inference.video_families import (
             default_video_generation_params,
             detect_video_family,

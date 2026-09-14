@@ -459,6 +459,28 @@ def test_video_guidance_comes_from_the_video_family_table():
     assert profile._resolve_guidance(unknown, "some/unknown-video-model") == 4.0
 
 
+def test_the_numerics_driver_resolves_guidance_without_a_backend_argument():
+    """A namespace with no ``backend`` resolves the image guidance instead of raising."""
+    # nvfp4_budget_vae_numerics imports this helper and parses no --backend of its own.
+    import argparse
+
+    profile = _script("nvfp4_budget_profile")
+    args = argparse.Namespace(guidance = None, family = "z-image")
+    assert profile._resolve_guidance(args, "Tongyi-MAI/Z-Image-Turbo") is not None
+    explicit = argparse.Namespace(guidance = 2.5, family = "z-image")
+    assert profile._resolve_guidance(explicit, "Tongyi-MAI/Z-Image-Turbo") == 2.5
+
+
+def test_both_drivers_unload_before_their_closing_bookend():
+    """The A/B driver's failure path unloads before the bookend too."""
+    import inspect
+
+    ab = _script("nvfp4_budget_attention_ab")
+    tail = inspect.getsource(ab.main).split("traceback.print_exc()")[1]
+    assert tail.index("backend.unload()") < tail.index('contention_check("post"')
+    assert tail.index('contention_check("post"') < tail.index("flush(exc)")
+
+
 def test_a_failed_cell_unloads_before_its_closing_bookend():
     """The failure path unloads before the contention bookend, which allocates on the same card."""
     # The bookend takes two 8192x8192 tensors: run before the unload, it raises again after an OOM and the failure
