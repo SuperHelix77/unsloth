@@ -1,41 +1,74 @@
 ---
 name: unsloth-local-codex
-description: Use the local Unsloth Studio repository as a Codex-like coding, planning, and inference workspace with durable Goal/Plan mode, GitHub ledger context, long-context Mac safeguards, and evidence-based speculative-decoding changes.
+description: Use Unsloth Helix as a local Codex-like coding, planning, and inference workspace with durable Goal/Plan mode, GitHub context, long-context Mac safeguards, skills, memory, and evidence-based performance changes.
 ---
 
-# Unsloth Local Codex
+# Unsloth Helix Local Codex
 
-Use this skill when working on the local Unsloth Studio app or when the user asks to turn it into a local Codex-style environment.
+Use this skill when working on Unsloth Helix or when the user wants a local Codex-style workflow backed by Unsloth Studio.
+
+> Helix is a beta/research surface. Keep changes measurable, reversible, and explicit about fallbacks.
 
 ## Operating rules
 
-- Keep Goal mode for the concrete outcome and Plan mode for the durable execution plan. Preserve both when reopening or switching chat threads.
-- Inspect the relevant GitHub ledger before applying a ledger-derived optimization. Treat benchmark claims as evidence with model, hardware, context, and runtime scope; do not promote a paper's best-case speedup to a universal promise.
+- Keep **Goal** mode for the concrete outcome and **Plan** mode for the durable execution plan. Preserve both when reopening or switching chat threads.
+- Inspect the relevant repository evidence before applying an optimization. Treat benchmark claims as scoped evidence with model, hardware, context, quantization, and runtime conditions; do not promote a best-case result to a universal promise.
 - Keep explicit user settings authoritative. Automatic policies may choose safe defaults, but must never silently overwrite an explicit context length, cache type, slot count, speculative mode, or placement choice.
-- For Mac Qwen3.8 GGUF, the V1.1 target is 64K context with conservative unified-memory settings. A fit-reduced window is runtime outcome, not user intent, and must not become a sticky request on the next reload.
-- MTP and DFlash are experimental unless the exact target/drafter pair and the installed llama.cpp capability probe agree. If a drafter fails, preserve target availability through ordinary-decoding fallback and record the requested mode for a later retry.
-- Qwythos-9B-v2 on MLX uses the published Qwen3.5-9B DFlash drafter when the target is compatible. Keep the app's durable 64K context policy, cap quantized verification at five tokens, and do not label this pairing DFlare: no target-specific Qwythos DFlare checkpoint is published.
-- On the supported Qwen3.8-27B Mac profile, the optimal automatic speculative choice is the target-matched DFlash/DFlash2 path available to the selected backend. Do not force DFlare on GGUF or call an MLX DFlash2 run DFlare; unsupported pairs must fall back clearly.
+- For the primary Mac Qwen3.8-27B profile, Helix targets 64K context when automatic settings and available unified memory permit it. A fit-reduced window is a runtime outcome, not user intent, and must not become a sticky request on the next reload.
+- MTP and DFlash-family modes are experimental unless the target/drafter pair and installed backend capability agree. If a drafter fails, preserve ordinary target decoding and report the fallback clearly.
+- Do not label an acceleration mode active merely because it was requested. Performance reports require runtime evidence such as an active speculative lane and accepted/committed draft tokens.
+- Prefer **memory** for facts, **skills** for repeatable procedures, **runtime repair** for infrastructure defects, and **QLoRA** only for recurring model-level behavior gaps that survive good context and skills.
+- Treat learned QLoRA adapters as challengers. Promotion requires the external benchmark gate; the model's own confidence or critique is not sufficient evidence.
+- Keep generated skills inspectable and reversible. Skill installation must not execute arbitrary repository scripts merely because a skill was discovered.
 
 ## GitHub context
 
-In the desktop app, the visible Skills menu and these local commands are available:
+In the desktop app, the visible Skills menu and these local commands are available where the corresponding feature is enabled:
 
-- `/github [query]` resolves the authenticated GitHub account and local Git remotes, then reads relevant repository or ledger files without requiring a URL.
+- `/github [query]` resolves authenticated GitHub/local repository context without requiring the user to paste a URL for every task.
 - `/plan [objective]` selects durable Plan mode.
 - `/goal [objective]` selects durable Goal mode.
-- `/speed` reports measured tok/s, context length, and whether speculative decoding is actually engaged.
-- `/skills` shows the command menu.
+- `/speed` reports measured runtime information such as tok/s, context length, and whether speculative decoding is actually engaged.
+- `/learn` opens/invokes the learning workflow.
+- `/skills` shows the command/skill menu.
+- `/skill-name request` injects the selected bounded `SKILL.md` instructions into the local request.
 
-The Skills menu also opens a local manager. It can create a portable `SKILL.md` or install a read-only GitHub skill repository into `~/.codex/skills`, `~/.claude/skills`, or both. Installed skill names appear in the `/` picker and `/skill-name request` injects the bounded `SKILL.md` instructions into the local request. Skill files are data for the local runtime; never execute repository scripts during installation.
+The Skills manager can create a portable `SKILL.md` or install a read-only skill repository into supported local skill locations. Skill files are instructions/data for the local runtime; do not execute repository scripts during installation.
 
-Use the bundled GitHub MCP server for repository, issue, PR, and ledger inspection when running in Codex. OAuth is handled by the MCP host; do not copy tokens into the plugin, repository, prompts, or logs. Prefer primary GitHub source and preserve commit or file provenance in implementation notes.
+Use the bundled read-only GitHub MCP connection for repository, issue, pull-request, and source inspection when running in Codex. OAuth is handled by the MCP host; do not copy tokens into the plugin, repository, prompts, skills, or logs.
 
-For performance reports, distinguish ordinary decode from speculative decoding. A speed multiplier is only evidence-backed when the runtime reports an active speculative slot and non-zero accepted draft tokens.
+Prefer primary GitHub source and preserve commit/file provenance in implementation notes when it materially supports a decision.
+
+## Learning policy
+
+When an episode suggests the system should learn something, classify it before changing durable state:
+
+1. **Nothing** — one-off noise, sampling variance, or insufficient evidence.
+2. **Memory** — durable fact, project state, prior result, or episodic context.
+3. **Ephemeral skill** — a novel procedure useful now but not yet proven recurrent.
+4. **Durable skill** — a repeatable, explicit procedure with evidence of reuse.
+5. **Runtime repair** — infrastructure/tool/backend behavior caused the failure.
+6. **QLoRA challenger** — a recurring model-level behavior gap not cleanly solved by context or skills.
+
+A QLoRA candidate must remain inactive until it passes the configured held-out comparison against the current baseline/champion. Preserve rollback.
+
+## Computer use
+
+Computer use is currently experimental and macOS-focused.
+
+- Screenshot is read-only.
+- Click, type, key, scroll, and app-opening actions are permission-gated.
+- Respect macOS Accessibility boundaries; report permission failures rather than bypassing them.
+- Do not use GUI automation when a safer, deterministic local tool/API is already available for the same operation.
 
 ## Delivery checklist
 
-1. Read the applicable ledger and identify what is implemented, deferred, or merely proposed.
-2. Add a small pure policy seam and regression test before wiring it through load, reload, and thread-restoration paths.
-3. Verify backend and frontend tests, formatting/type checks, and `git diff --check`.
-4. Build the Mac app before claiming the installed app changed. Report physical unified-memory limits separately from software policy limits.
+1. Identify the concrete goal, current plan, relevant repository state, and permission boundary.
+2. Establish the current baseline before replacing or optimizing a module.
+3. Add the smallest policy/implementation seam that can be independently tested and disabled.
+4. Verify backend/frontend tests relevant to the change plus formatting/type/build checks as appropriate.
+5. Measure the replacement against the baseline on the same workload.
+6. Report fallbacks and unsupported paths explicitly; do not count requested-but-inactive acceleration as success.
+7. Keep learned skills/adapters reversible and preserve the prior champion/baseline.
+8. Build the target app before claiming the installed application changed.
+9. Report physical unified-memory limits separately from software policy limits.
