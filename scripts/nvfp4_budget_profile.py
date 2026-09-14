@@ -342,10 +342,18 @@ def classify(
         return "fp4_gemm"
     # The NVFP4 ordering barrier is a 1-element bf16 ``zero_()`` fired from ``_mm_impl`` (see
     # ``diffusion_nvfp4_ops._fire_barrier``), so it is a bf16 FillFunctor inside the denoise window
-    # and nowhere else. A bare ``FillFunctor`` test also swallows the ordinary fills a pipeline,
-    # scheduler or VAE launches: the fp8 arms, which have no barrier at all, reported one.
-    if "fillfunctor<c10::bfloat16>" in low and window == "phase:denoise":
+    # of the NVFP4 arm and nowhere else. A bare ``FillFunctor`` test also swallows the ordinary fills
+    # a pipeline, scheduler or VAE launches, and the window alone does not exclude them: the bf16 and
+    # fp8 control arms fire no barrier, so a bf16 fill of theirs would invent barrier time.
+    if "fillfunctor<c10::bfloat16>" in low and window == "phase:denoise" and arm == "nvfp4":
         return "barrier_fill"
+    # An inductor kernel is an inductor kernel whatever it was fused from, so this outranks EVERY
+    # fuzzy operation-name test below: inductor names a fused kernel after the ops in it
+    # (``triton_poi_fused__scaled_dot_product_cudnn_attention_add_7``), so a
+    # ``triton_poi_fused__scaled_mm_...`` would otherwise be filed as scaled-MM time and a
+    # ``..._int8_...`` as int8, charging compiled elementwise work to the GEMM budget.
+    if low.startswith("triton"):
+        return "inductor_triton"
     # fp8: torchao/cublas scaled_mm. ``nvjet_`` is cublasLt's SM100 GEMM family and carries no dtype
     # in its name, so it only means scaled_mm on the fp8 arm inside the denoise window. A bf16 arm,
     # and the linears a partially converted NVFP4 transformer leaves unquantised, dispatch dense
@@ -356,10 +364,6 @@ def classify(
         return "fp8_scaled_mm" if (window == "phase:denoise" and arm == "fp8") else "gemm_other"
     if "int8" in low or "i8gemm" in low or "s8s8" in low:
         return "int8"
-    # An inductor kernel is an inductor kernel whatever it was fused from, so this outranks the
-    # fuzzy attention substrings (``triton_poi_fused__scaled_dot_product_cudnn_attention_...``).
-    if low.startswith("triton"):
-        return "inductor_triton"
     if "sm100_flash_fwd" in low or "cudnn_generated_fort_native_sdpa" in low or "cudnn" in low:
         return "attention_cudnn"
     if "flash_fwd" in low or "pytorch_flash" in low or "flash_fprop" in low:
@@ -433,7 +437,10 @@ def bucket_table(
     trace = json.loads(Path(trace_path).read_text())
     windows = _phase_windows(trace)
     per_bucket: dict = defaultdict(lambda: [0.0, 0])
-    per_name: dict = defaultdict(lambda: [0.0, 0, ""])
+    # Keyed on ``(name, bucket)``: one kernel specialization can run in more than one phase window
+    # (an nvjet GEMM in the text encoder and again in the denoiser), and a name-only key summed both
+    # under whichever bucket happened to land last.
+    per_name: dict = defaultdict(lambda: [0.0, 0])
     per_window: dict = defaultdict(lambda: [0.0, 0])
     memcpy_d2d = {"calls": 0, "us": 0.0}
     host = defaultdict(int)
@@ -463,10 +470,9 @@ def bucket_table(
         b = per_bucket[bucket]
         b[0] += dur
         b[1] += 1
-        k = per_name[name]
+        k = per_name[(name, bucket)]
         k[0] += dur
         k[1] += 1
-        k[2] = bucket
         w = per_window[win or "scheduler_other"]
         w[0] += dur
         w[1] += 1
@@ -495,17 +501,17 @@ def bucket_table(
         (
             {
                 "name": n,
-                "bucket": v[2],
+                "bucket": b,
                 "ms_per_render": v[0] / n_renders / 1e3,
                 "calls_per_render": v[1] / n_renders,
                 "us_per_call": v[0] / v[1],
             }
-            for n, v in per_name.items()
+            for (n, b), v in per_name.items()
         ),
         key = lambda r: -r["ms_per_render"],
     )
     unmatched = [r for r in top if r["bucket"] == "other"][:30]
-    attn_names = sorted({n for n, v in per_name.items() if v[2] in ATTENTION_BUCKETS})
+    attn_names = sorted({n for n, b in per_name if b in ATTENTION_BUCKETS})
     attn_rows = [r for r in top if r["bucket"] in ATTENTION_BUCKETS]
     return {
         "buckets": rows(per_bucket),
@@ -520,7 +526,7 @@ def bucket_table(
             "ms_per_render": memcpy_d2d["us"] / n_renders / 1e3,
         },
         "phase_window_events": len(windows),
-        "distinct_kernels": len(per_name),
+        "distinct_kernels": len({n for n, _bucket in per_name}),
         "device_kernel_launches_per_render": sum(v[1] for v in per_bucket.values()) / n_renders,
         "host_launch_api_calls_per_render": {k: v / n_renders for k, v in host.items()},
         "gpu_busy_union_raw": busy,

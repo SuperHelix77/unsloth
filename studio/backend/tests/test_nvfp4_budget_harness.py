@@ -3,6 +3,7 @@
 
 """The pure parts of the NVFP4 time-budget harness that decide what a measurement MEANS."""
 
+import json
 import importlib.util
 import sys
 import types
@@ -62,10 +63,16 @@ def test_only_the_bf16_barrier_fill_is_charged_to_the_nvfp4_barrier():
         "void at::native::vectorized_elementwise_kernel<4, at::native::FillFunctor<float>,"
         " std::array<char*, 1ul> >(int, at::native::FillFunctor<float>, std::array<char*, 1ul>)"
     )
-    assert profile.classify(barrier, "phase:denoise") == "barrier_fill"
-    assert profile.classify(barrier, None) == "elementwise_eager"
-    assert profile.classify(generic, "phase:denoise") == "elementwise_eager"
-    assert profile.classify(generic, "phase:vae") == "vae_decode"
+    assert profile.classify(barrier, "phase:denoise", "nvfp4") == "barrier_fill"
+    assert profile.classify(barrier, None, "nvfp4") == "elementwise_eager"
+    assert profile.classify(generic, "phase:denoise", "nvfp4") == "elementwise_eager"
+    assert profile.classify(generic, "phase:vae", "nvfp4") == "vae_decode"
+    # Only the nvfp4 arm fires the barrier, so the same bf16 fill in a control arm's denoise window
+    # is an ordinary fill. The window alone does not separate them, and calling it barrier_fill
+    # invents barrier time in the very arms the barrier is measured against.
+    assert profile.classify(barrier, "phase:denoise", "bf16") == "elementwise_eager"
+    assert profile.classify(barrier, "phase:denoise", "fp8") == "elementwise_eager"
+    assert profile.classify(barrier, "phase:denoise") == "elementwise_eager"
 
 
 def test_each_graph_arm_writes_its_own_latent_and_trace():
@@ -84,6 +91,14 @@ def test_an_inductor_kernel_is_inductor_time_whatever_it_was_fused_from():
     profile = _script("nvfp4_budget_profile")
     fused = "triton_poi_fused__scaled_dot_product_cudnn_attention_add_7"
     assert profile.classify(fused, "phase:denoise") == "inductor_triton"
+    # Inductor names a fused kernel after the ops in it, so the GEMM tokens turn up in triton names
+    # too. Matching them first charged compiled elementwise work to the scaled-MM and int8 budgets.
+    assert profile.classify("triton_poi_fused__scaled_mm_mul_3", "phase:denoise", "fp8") == (
+        "inductor_triton"
+    )
+    assert profile.classify("triton_red_fused_int8_weight_only_2", "phase:denoise", "int8") == (
+        "inductor_triton"
+    )
 
 
 def test_the_phase_window_outranks_the_kernel_name():
@@ -107,6 +122,48 @@ def test_only_the_fp8_arm_reads_a_denoise_nvjet_gemm_as_scaled_mm():
     # A kernel that names the scaled path stays fp8 whatever the arm says.
     scaled = "cutlass3x_sm100_enable_3x_kernel_for_sm10x"
     assert profile.classify(scaled, "phase:denoise", "bf16") == "fp8_scaled_mm"
+
+
+def test_one_kernel_name_in_two_windows_keeps_its_time_under_each_bucket(tmp_path):
+    # The same nvjet specialization serves the text encoder and then the denoiser. Keyed on the name
+    # alone, per_name summed both occurrences and kept whichever bucket landed last, so top_kernels
+    # reported the combined time entirely as fp8_scaled_mm.
+    profile = _script("nvfp4_budget_profile")
+    gemm = "nvjet_tst_128x128_64x4_1x1_v_bz_coopA_NTn"
+    trace = tmp_path / "trace.json"
+    trace.write_text(
+        json.dumps(
+            {
+                "traceEvents": [
+                    {
+                        "ph": "X",
+                        "cat": "user_annotation",
+                        "ts": 0.0,
+                        "dur": 1000.0,
+                        "name": "phase:te",
+                    },
+                    {
+                        "ph": "X",
+                        "cat": "user_annotation",
+                        "ts": 2000.0,
+                        "dur": 1000.0,
+                        "name": "phase:denoise",
+                    },
+                    {"ph": "X", "cat": "kernel", "ts": 100.0, "dur": 300.0, "name": gemm},
+                    {"ph": "X", "cat": "kernel", "ts": 2100.0, "dur": 700.0, "name": gemm},
+                ]
+            }
+        )
+    )
+    table = profile.bucket_table(trace, 1, 4, "fp8")
+    rows = {(r["name"], r["bucket"]): r for r in table["top_kernels"]}
+    assert set(rows) == {(gemm, "text_encoder"), (gemm, "fp8_scaled_mm")}
+    assert rows[(gemm, "text_encoder")]["ms_per_render"] == pytest.approx(0.3)
+    assert rows[(gemm, "fp8_scaled_mm")]["ms_per_render"] == pytest.approx(0.7)
+    # The bucket totals were always right; distinct_kernels still counts NAMES, not rows.
+    assert table["buckets"]["text_encoder"]["ms_per_render"] == pytest.approx(0.3)
+    assert table["buckets"]["fp8_scaled_mm"]["ms_per_render"] == pytest.approx(0.7)
+    assert table["distinct_kernels"] == 1
 
 
 def test_gpu_busy_unions_overlapping_intervals_instead_of_summing_them(tmp_path):

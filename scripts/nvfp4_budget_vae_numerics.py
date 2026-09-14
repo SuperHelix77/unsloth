@@ -171,10 +171,17 @@ def main(argv = None) -> int:
     def timed(fn):
         torch.cuda.synchronize()
         t0 = time.perf_counter()
-        with torch.no_grad():
+        # inference_mode, not no_grad: the shipped path runs the pipeline, and with it this decode,
+        # under inference_mode (diffusion.py, "inference_mode is faster than no_grad and numerically
+        # identical here"). Dynamo guards on the grad mode, so a graph compiled under no_grad is not
+        # the graph that ships and its compile wall and steady time describe a configuration nobody
+        # runs.
+        with torch.inference_mode():
             out = call(fn)
         torch.cuda.synchronize()
-        return time.perf_counter() - t0, sample_of(out).detach().float()
+        # clone() leaves inference-tensor land. An inference tensor cannot be saved for backward and
+        # everything downstream (the diff, the PNG, LPIPS) is ordinary tensor work.
+        return time.perf_counter() - t0, sample_of(out).detach().clone().float()
 
     _, ref = timed(eager_decode)
     eager_walls = [timed(eager_decode)[0] for _ in range(3)]
